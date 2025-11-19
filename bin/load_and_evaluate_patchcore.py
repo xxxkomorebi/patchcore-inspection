@@ -13,6 +13,7 @@ import patchcore.metrics
 import patchcore.patchcore
 import patchcore.sampler
 import patchcore.utils
+import torch.utils.data
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def run(methods, results_path, gpu, seed, save_segmentation_images):
             )
         )
 
-        patchcore.utils.fix_seeds(seed, device)
+        patchcore.utils.fix_seeds(seed, with_torch=True)
 
         dataset_name = dataloaders["testing"].name
 
@@ -269,9 +270,9 @@ def dataset(
                 pin_memory=True,
             )
 
-            test_dataloader.name = name
+            setattr(test_dataloader, 'name', name)
             if subdataset is not None:
-                test_dataloader.name += "_" + subdataset
+                setattr(test_dataloader, 'name', getattr(test_dataloader, 'name') + "_" + subdataset)
 
             dataloader_dict = {"testing": test_dataloader}
 

@@ -2,7 +2,9 @@ import os
 from enum import Enum
 
 import PIL
+import PIL.Image
 import torch
+import torch.utils.data
 from torchvision import transforms
 
 _CLASSNAMES = [
@@ -107,6 +109,7 @@ class MVTecDataset(torch.utils.data.Dataset):
             "is_anomaly": int(anomaly != "good"),
             "image_name": "/".join(image_path.split("/")[-4:]),
             "image_path": image_path,
+            "aux_data": None, # Added for multi-modal compatibility
         }
 
     def __len__(self):

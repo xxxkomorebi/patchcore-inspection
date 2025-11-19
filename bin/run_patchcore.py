@@ -13,6 +13,7 @@ import patchcore.metrics
 import patchcore.patchcore
 import patchcore.sampler
 import patchcore.utils
+import torch.utils.data
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def run(
             )
         )
 
-        patchcore.utils.fix_seeds(seed, device)
+        patchcore.utils.fix_seeds(seed, with_torch=True)
 
         dataset_name = dataloaders["training"].name
 
@@ -88,8 +89,8 @@ def run(
                 )
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
-                if PatchCore.backbone.seed is not None:
-                    patchcore.utils.fix_seeds(PatchCore.backbone.seed, device)
+                # VQ-VAE architecture does not rely on backbone seeds.
+                patchcore.utils.fix_seeds(seed, with_torch=True)
                 LOGGER.info(
                     "Training models ({}/{})".format(i + 1, len(PatchCore_list))
                 )
@@ -239,78 +240,75 @@ def run(
 
 @main.command("patch_core")
 # Pretraining-specific parameters.
-@click.option("--backbone_names", "-b", type=str, multiple=True, default=[])
-@click.option("--layers_to_extract_from", "-le", type=str, multiple=True, default=[])
-# Parameters for Glue-code (to merge different parts of the pipeline.
-@click.option("--pretrain_embed_dimension", type=int, default=1024)
-@click.option("--target_embed_dimension", type=int, default=1024)
-@click.option("--preprocessing", type=click.Choice(["mean", "conv"]), default="mean")
-@click.option("--aggregation", type=click.Choice(["mean", "mlp"]), default="mean")
-# Nearest-Neighbour Anomaly Scorer parameters.
-@click.option("--anomaly_scorer_num_nn", type=int, default=5)
+@click.option("--vq_in_channels", type=int, default=3)
+@click.option("--vq_out_channels", type=int, default=3)
+@click.option("--vq_num_hiddens", type=int, default=128)
+@click.option("--vq_num_residual_layers", type=int, default=0)
+@click.option("--vq_num_residual_hiddens", type=int, default=0)
+@click.option("--vq_num_embeddings", type=int, default=512)
+@click.option("--vq_embedding_dim", type=int, default=64)
+@click.option("--vq_commitment_cost", type=float, default=0.25)
+@click.option("--vq_aux_dim", type=int, default=0, help="Dimension of auxiliary input data (0 if none).")
+# VQ-VAE Training Parameters
+@click.option("--vq_lr", type=float, default=1e-4)
+@click.option("--vq_epochs", type=int, default=10)
 # Patch-parameters.
 @click.option("--patchsize", type=int, default=3)
 @click.option("--patchscore", type=str, default="max")
 @click.option("--patchoverlap", type=float, default=0.0)
-@click.option("--patchsize_aggregate", "-pa", type=int, multiple=True, default=[])
+# Nearest-Neighbour Anomaly Scorer parameters.
+@click.option("--anomaly_scorer_num_nn", type=int, default=5)
 # NN on GPU.
 @click.option("--faiss_on_gpu", is_flag=True)
 @click.option("--faiss_num_workers", type=int, default=8)
 def patch_core(
-    backbone_names,
-    layers_to_extract_from,
-    pretrain_embed_dimension,
-    target_embed_dimension,
-    preprocessing,
-    aggregation,
+    vq_in_channels,
+    vq_out_channels,
+    vq_num_hiddens,
+    vq_num_residual_layers,
+    vq_num_residual_hiddens,
+    vq_num_embeddings,
+    vq_embedding_dim,
+    vq_commitment_cost,
+    vq_aux_dim,
+    vq_lr,
+    vq_epochs,
     patchsize,
     patchscore,
     patchoverlap,
     anomaly_scorer_num_nn,
-    patchsize_aggregate,
     faiss_on_gpu,
     faiss_num_workers,
 ):
-    backbone_names = list(backbone_names)
-    if len(backbone_names) > 1:
-        layers_to_extract_from_coll = [[] for _ in range(len(backbone_names))]
-        for layer in layers_to_extract_from:
-            idx = int(layer.split(".")[0])
-            layer = ".".join(layer.split(".")[1:])
-            layers_to_extract_from_coll[idx].append(layer)
-    else:
-        layers_to_extract_from_coll = [layers_to_extract_from]
-
+    # We assume a single PatchCore instance using the VQ-VAE architecture.
+    # Ensemble logic is removed for VQ-VAE integration simplicity.
+    
     def get_patchcore(input_shape, sampler, device):
-        loaded_patchcores = []
-        for backbone_name, layers_to_extract_from in zip(
-            backbone_names, layers_to_extract_from_coll
-        ):
-            backbone_seed = None
-            if ".seed-" in backbone_name:
-                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(
-                    backbone_name.split("-")[-1]
-                )
-            backbone = patchcore.backbones.load(backbone_name)
-            backbone.name, backbone.seed = backbone_name, backbone_seed
+        nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
 
-            nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
-
-            patchcore_instance = patchcore.patchcore.PatchCore(device)
-            patchcore_instance.load(
-                backbone=backbone,
-                layers_to_extract_from=layers_to_extract_from,
-                device=device,
-                input_shape=input_shape,
-                pretrain_embed_dimension=pretrain_embed_dimension,
-                target_embed_dimension=target_embed_dimension,
-                patchsize=patchsize,
-                featuresampler=sampler,
-                anomaly_scorer_num_nn=anomaly_scorer_num_nn,
-                nn_method=nn_method,
-            )
-            loaded_patchcores.append(patchcore_instance)
-        return loaded_patchcores
+        patchcore_instance = patchcore.patchcore.PatchCore(device)
+        patchcore_instance.load(
+            device=device,
+            input_shape=input_shape,
+            # VQ-VAE Params
+            vq_in_channels=vq_in_channels,
+            vq_out_channels=vq_out_channels,
+            vq_num_hiddens=vq_num_hiddens,
+            vq_num_residual_layers=vq_num_residual_layers,
+            vq_num_residual_hiddens=vq_num_residual_hiddens,
+            vq_num_embeddings=vq_num_embeddings,
+            vq_embedding_dim=vq_embedding_dim,
+            vq_commitment_cost=vq_commitment_cost,
+            vq_aux_dim=vq_aux_dim,
+            # PatchCore Params
+            patchsize=patchsize,
+            featuresampler=sampler,
+            anomaly_scorer_num_nn=anomaly_scorer_num_nn,
+            nn_method=nn_method,
+            vq_lr=vq_lr,
+            vq_epochs=vq_epochs,
+        )
+        return [patchcore_instance] # Return as list for compatibility with ensemble logic
 
     return ("get_patchcore", get_patchcore)
 
@@ -393,9 +391,9 @@ def dataset(
                 pin_memory=True,
             )
 
-            train_dataloader.name = name
+            setattr(train_dataloader, 'name', name)
             if subdataset is not None:
-                train_dataloader.name += "_" + subdataset
+                setattr(train_dataloader, 'name', getattr(train_dataloader, 'name') + "_" + subdataset)
 
             if train_val_split < 1:
                 val_dataset = dataset_library.__dict__[dataset_info[1]](
