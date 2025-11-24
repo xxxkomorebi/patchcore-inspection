@@ -2,10 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# -----------------------------------------------------------------------------
-# 1. Vector Quantizer (Codebook)
-# -----------------------------------------------------------------------------
-
 class VectorQuantizer(nn.Module):
     """
     Vector Quantizer (Codebook) module.
@@ -73,10 +69,6 @@ class VectorQuantizer(nn.Module):
 
         return quantized, loss, perplexity, encoding_indices.view(input_shape[:-1])
 
-# -----------------------------------------------------------------------------
-# 2. Encoder and Decoder (Simple ConvNet for feature map output)
-# -----------------------------------------------------------------------------
-
 class Encoder(nn.Module):
     """
     Simple Encoder for VQ-VAE. Designed to output a feature map.
@@ -138,14 +130,8 @@ class Decoder(nn.Module):
         h = F.relu(self.conv_t1(h))
         return self.conv_t2(h) # Output reconstruction [B, out_channels, H, W]
 
-# -----------------------------------------------------------------------------
-# 3. VQVAE Model
-# -----------------------------------------------------------------------------
-
 class VQVAE(nn.Module):
-    """
-    VQ-VAE Model integrating Encoder, Quantizer, and Decoder.
-    """
+
     def __init__(self, in_channels, out_channels, num_hiddens, num_residual_layers, num_residual_hiddens,
                  num_embeddings, embedding_dim, commitment_cost, aux_dim=0):
         super().__init__()
