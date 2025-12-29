@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import logging
 import os
 import sys
@@ -6,18 +7,21 @@ import sys
 import click
 import numpy as np
 import torch
-
-import patchcore.backbones
+import PIL.Image
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+import matplotlib.pyplot as plt
 import patchcore.common
 import patchcore.metrics
 import patchcore.patchcore
-import patchcore.sampler
 import patchcore.utils
 import torch.utils.data
 
 LOGGER = logging.getLogger(__name__)
 
-_DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
+_DATASETS = {
+    "mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"],
+    "mpdd":["patchcore.datasets.mpdd", "MPDDDataset"]
+    }
 
 
 @click.group(chain=True)
@@ -28,6 +32,7 @@ _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 @click.option("--log_project", type=str, default="project")
 @click.option("--save_segmentation_images", is_flag=True)
 @click.option("--save_patchcore_model", is_flag=True)
+@click.option("--save_recon", is_flag=True, help="保存重建图，并计算 PSNR/SSIM")
 def main(**kwargs):
     pass
 
@@ -42,6 +47,7 @@ def run(
     log_project,
     save_segmentation_images,
     save_patchcore_model,
+    save_recon,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -79,10 +85,7 @@ def run(
         with device_context:
             torch.cuda.empty_cache()
             imagesize = dataloaders["training"].dataset.imagesize
-            sampler = methods["get_sampler"](
-                device,
-            )
-            PatchCore_list = methods["get_patchcore"](imagesize, sampler, device)
+            PatchCore_list = methods["get_patchcore"](imagesize,device)
             if len(PatchCore_list) > 1:
                 LOGGER.info(
                     "Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list))
@@ -97,8 +100,21 @@ def run(
                 torch.cuda.empty_cache()
                 PatchCore.fit(dataloaders["training"])
 
+            # 保存每个 epoch 的 perplexity 到 CSV
+            if hasattr(PatchCore, "perplexity_history"):
+                import csv
+                per_csv_path = os.path.join(run_save_path, "perplexity_epoch.csv")
+                with open(per_csv_path, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["epoch", "perplexity"])
+                    for idx, val in enumerate(PatchCore.perplexity_history, start=1):
+                        writer.writerow([idx, val])
+
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
+            recon_collector = []
+            input_collector = []
+            fetch_recon = save_recon or save_segmentation_images
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 LOGGER.info(
@@ -106,9 +122,16 @@ def run(
                         i + 1, len(PatchCore_list)
                     )
                 )
-                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(
-                    dataloaders["testing"]
-                )
+                if fetch_recon:
+                    scores, segmentations, labels_gt, masks_gt, recons, inputs_raw = PatchCore.predict(
+                        dataloaders["testing"], return_recon=True
+                    )
+                    recon_collector.append(recons)
+                    input_collector.append(inputs_raw)
+                else:
+                    scores, segmentations, labels_gt, masks_gt = PatchCore.predict(
+                        dataloaders["testing"]
+                    )
                 aggregator["scores"].append(scores)
                 aggregator["segmentations"].append(segmentations)
 
@@ -136,8 +159,8 @@ def run(
                 x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
             ]
 
-            # (Optional) Plot example images.
-            if save_segmentation_images:
+            # 需要原始路径时一次性提取
+            if save_segmentation_images or save_recon:
                 image_paths = [
                     x[2] for x in dataloaders["testing"].dataset.data_to_iterate
                 ]
@@ -145,6 +168,7 @@ def run(
                     x[3] for x in dataloaders["testing"].dataset.data_to_iterate
                 ]
 
+            if save_segmentation_images:
                 def image_transform(image):
                     in_std = np.array(
                         dataloaders["testing"].dataset.transform_std
@@ -173,6 +197,74 @@ def run(
                     image_transform=image_transform,
                     mask_transform=mask_transform,
                 )
+
+                # 若需要重建图，可在此同时保存重建和分割可视化
+                if len(recon_collector) > 0:
+                    recons = recon_collector[0]
+                    inputs_raw = input_collector[0]
+                    in_std = np.array(
+                        dataloaders["testing"].dataset.transform_std
+                    ).reshape(-1, 1, 1)
+                    in_mean = np.array(
+                        dataloaders["testing"].dataset.transform_mean
+                    ).reshape(-1, 1, 1)
+
+                    recon_vis_path = os.path.join(
+                        run_save_path, "recon_segmentation_images", dataset_name
+                    )
+                    os.makedirs(recon_vis_path, exist_ok=True)
+                    # 仅保存四联图与指标，指标随四联图放在同一目录
+                    metrics_path = os.path.join(
+                        recon_vis_path, "reconstruction_metrics.csv"
+                    )
+                    with open(metrics_path, "w", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["image", "psnr", "ssim"])
+                        for idx, (img_path, recon, inp) in enumerate(zip(image_paths, recons, inputs_raw)):
+                            recon_np = recon.numpy()
+                            inp_np = inp.numpy()
+                            recon_denorm = np.clip((recon_np * in_std + in_mean), 0, 1)
+                            inp_denorm = np.clip((inp_np * in_std + in_mean), 0, 1)
+                            recon_img = np.clip(recon_denorm * 255, 0, 255).astype(np.uint8).transpose(1, 2, 0)
+                            inp_img = np.clip(inp_denorm * 255, 0, 255).astype(np.uint8).transpose(1, 2, 0)
+
+                            psnr_val = peak_signal_noise_ratio(inp_img, recon_img, data_range=255)
+                            ssim_val = structural_similarity(inp_img, recon_img, channel_axis=2, data_range=255)
+
+                            savename = "_".join(img_path.split("/")[-4:])
+                            writer.writerow([img_path, f"{psnr_val:.3f}", f"{ssim_val:.3f}"])
+
+                            seg_map = segmentations[idx]
+                            if mask_paths[idx] is not None:
+                                mask_np = dataloaders["testing"].dataset.transform_mask(
+                                    PIL.Image.open(mask_paths[idx]).convert("RGB")
+                                ).numpy()
+                                if mask_np.ndim == 3:
+                                    mask_np = mask_np[0]
+                                mask_np = np.squeeze(mask_np)
+                            else:
+                                mask_np = np.zeros_like(seg_map)
+
+                            fig, axes = plt.subplots(1, 4, figsize=(12, 3))
+                            axes[0].imshow(inp_img)
+                            axes[0].set_title("input")
+                            axes[0].axis("off")
+
+                            axes[1].imshow(mask_np, cmap="gray")
+                            axes[1].set_title("gt mask")
+                            axes[1].axis("off")
+
+                            axes[2].imshow(seg_map, cmap="viridis")
+                            axes[2].set_title("anomaly map")
+                            axes[2].axis("off")
+
+                            axes[3].imshow(recon_img)
+                            axes[3].set_title("recon")
+                            axes[3].axis("off")
+
+                            plt.tight_layout()
+                            fig.savefig(os.path.join(recon_vis_path, savename))
+                            plt.close(fig)
 
             LOGGER.info("Computing evaluation metrics.")
             auroc = patchcore.metrics.compute_imagewise_retrieval_metrics(
@@ -248,19 +340,23 @@ def run(
 @click.option("--vq_num_embeddings", type=int, default=512)
 @click.option("--vq_embedding_dim", type=int, default=64)
 @click.option("--vq_commitment_cost", type=float, default=0.25)
-@click.option("--vq_aux_dim", type=int, default=0, help="Dimension of auxiliary input data (0 if none).")
+# EMA codebook parameters
+@click.option("--vq_use_ema_codebook", is_flag=True, help="Use EMA-based codebook update instead of direct gradient update.")
+@click.option("--vq_ema_decay", type=float, default=0.99, show_default=True)
+@click.option("--vq_ema_eps", type=float, default=1e-5, show_default=True)
+# New parameters for pre-trained backbone
+@click.option("--vq_backbone_name", type=str, default=None, help="Name of the pre-trained backbone to use for the VQ-VAE encoder.")
+@click.option("--vq_layers_to_extract_from", type=str, multiple=True, default=None, help="Layers to extract features from for the VQ-VAE encoder.")
 # VQ-VAE Training Parameters
 @click.option("--vq_lr", type=float, default=1e-4)
 @click.option("--vq_epochs", type=int, default=10)
 # Patch-parameters.
 @click.option("--patchsize", type=int, default=3)
-@click.option("--patchscore", type=str, default="max")
-@click.option("--patchoverlap", type=float, default=0.0)
 # Nearest-Neighbour Anomaly Scorer parameters.
-@click.option("--anomaly_scorer_num_nn", type=int, default=5)
-# NN on GPU.
-@click.option("--faiss_on_gpu", is_flag=True)
-@click.option("--faiss_num_workers", type=int, default=8)
+# @click.option("--anomaly_scorer_num_nn", type=int, default=5)
+# # NN on GPU.
+# @click.option("--faiss_on_gpu", is_flag=True)
+# @click.option("--faiss_num_workers", type=int, default=8)
 def patch_core(
     vq_in_channels,
     vq_out_channels,
@@ -270,21 +366,20 @@ def patch_core(
     vq_num_embeddings,
     vq_embedding_dim,
     vq_commitment_cost,
-    vq_aux_dim,
+    vq_use_ema_codebook,
+    vq_ema_decay,
+    vq_ema_eps,
+    vq_backbone_name,
+    vq_layers_to_extract_from,
     vq_lr,
     vq_epochs,
     patchsize,
-    patchscore,
-    patchoverlap,
-    anomaly_scorer_num_nn,
-    faiss_on_gpu,
-    faiss_num_workers,
 ):
     # We assume a single PatchCore instance using the VQ-VAE architecture.
     # Ensemble logic is removed for VQ-VAE integration simplicity.
     
-    def get_patchcore(input_shape, sampler, device):
-        nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
+    def get_patchcore(input_shape,device):
+        # nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
 
         patchcore_instance = patchcore.patchcore.PatchCore(device)
         patchcore_instance.load(
@@ -299,34 +394,19 @@ def patch_core(
             vq_num_embeddings=vq_num_embeddings,
             vq_embedding_dim=vq_embedding_dim,
             vq_commitment_cost=vq_commitment_cost,
-            vq_aux_dim=vq_aux_dim,
+            vq_use_ema_codebook=vq_use_ema_codebook,
+            vq_ema_decay=vq_ema_decay,
+            vq_ema_eps=vq_ema_eps,
+            vq_backbone_name=vq_backbone_name,
+            vq_layers_to_extract_from=vq_layers_to_extract_from,
             # PatchCore Params
             patchsize=patchsize,
-            featuresampler=sampler,
-            anomaly_scorer_num_nn=anomaly_scorer_num_nn,
-            nn_method=nn_method,
             vq_lr=vq_lr,
             vq_epochs=vq_epochs,
         )
         return [patchcore_instance] # Return as list for compatibility with ensemble logic
 
     return ("get_patchcore", get_patchcore)
-
-
-@main.command("sampler")
-@click.argument("name", type=str)
-@click.option("--percentage", "-p", type=float, default=0.1, show_default=True)
-def sampler(name, percentage):
-    def get_sampler(device):
-        if name == "identity":
-            return patchcore.sampler.IdentitySampler()
-        elif name == "greedy_coreset":
-            return patchcore.sampler.GreedyCoresetSampler(percentage, device)
-        elif name == "approx_greedy_coreset":
-            return patchcore.sampler.ApproximateGreedyCoresetSampler(percentage, device)
-
-    return ("get_sampler", get_sampler)
-
 
 @main.command("dataset")
 @click.argument("name", type=str)

@@ -128,6 +128,7 @@ def compute_and_store_final_results(
     results_path,
     results,
     row_names=None,
+    precision=3,
     column_names=[
         "Instance AUROC",
         "Full Pixel AUROC",
@@ -153,6 +154,11 @@ def compute_and_store_final_results(
         mean_metrics[result_key] = np.mean([x[i] for x in results])
         LOGGER.info("{0}: {1:3.3f}".format(result_key, mean_metrics[result_key]))
 
+    def _format_value(value):
+        if isinstance(value, (float, np.floating)):
+            return f"{value:.{precision}f}"
+        return value
+
     savename = os.path.join(results_path, "results.csv")
     with open(savename, "w") as csv_file:
         csv_writer = csv.writer(csv_file, delimiter=",")
@@ -162,11 +168,11 @@ def compute_and_store_final_results(
 
         csv_writer.writerow(header)
         for i, result_list in enumerate(results):
-            csv_row = result_list
+            csv_row = [_format_value(x) for x in result_list]
             if row_names is not None:
-                csv_row = [row_names[i]] + result_list
+                csv_row = [row_names[i]] + csv_row
             csv_writer.writerow(csv_row)
-        mean_scores = list(mean_metrics.values())
+        mean_scores = [_format_value(x) for x in list(mean_metrics.values())]
         if row_names is not None:
             mean_scores = ["Mean"] + mean_scores
         csv_writer.writerow(mean_scores)

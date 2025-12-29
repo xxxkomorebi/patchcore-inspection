@@ -73,6 +73,10 @@ class MVTecDataset(torch.utils.data.Dataset):
 
         self.imgpaths_per_class, self.data_to_iterate = self.get_image_data()
 
+        # 记录归一化使用的均值和方差，供可视化/反归一化等场景使用
+        self.transform_mean = IMAGENET_MEAN
+        self.transform_std = IMAGENET_STD
+
         self.transform_img = [
             transforms.Resize(resize),
             transforms.CenterCrop(imagesize),
@@ -109,7 +113,6 @@ class MVTecDataset(torch.utils.data.Dataset):
             "is_anomaly": int(anomaly != "good"),
             "image_name": "/".join(image_path.split("/")[-4:]),
             "image_path": image_path,
-            "aux_data": None, # Added for multi-modal compatibility
         }
 
     def __len__(self):

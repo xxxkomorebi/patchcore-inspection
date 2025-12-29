@@ -177,6 +177,8 @@ class Aggregator(torch.nn.Module):
 
     def forward(self, features):
         """Returns reshaped and average pooled features."""
+        if isinstance(features, list):
+            features = features[0]
         # batchsize x number_of_layers x input_dim -> batchsize x target_dim
         features = features.reshape(len(features), 1, -1)
         features = F.adaptive_avg_pool1d(features, self.target_dim)
@@ -258,13 +260,7 @@ class NetworkFeatureAggregator(torch.nn.Module):
 
     def forward(self, images):
         self.outputs.clear()
-        with torch.no_grad():
-            # The backbone will throw an Exception once it reached the last
-            # layer to compute features from. Computation will stop there.
-            try:
-                _ = self.backbone(images)
-            except LastLayerToExtractReachedException:
-                pass
+        _ = self.backbone(images)
         return self.outputs
 
     def feature_dimensions(self, input_shape):
@@ -278,14 +274,11 @@ class ForwardHook:
     def __init__(self, hook_dict, layer_name: str, last_layer_to_extract: str):
         self.hook_dict = hook_dict
         self.layer_name = layer_name
-        self.raise_exception_to_break = copy.deepcopy(
-            layer_name == last_layer_to_extract
-        )
+        # 允许梯度向前传播，避免在最后一层提前终止前向（方便端到端微调）
+        self.raise_exception_to_break = False
 
     def __call__(self, module, input, output):
         self.hook_dict[self.layer_name] = output
-        if self.raise_exception_to_break:
-            raise LastLayerToExtractReachedException()
         return None
 
 

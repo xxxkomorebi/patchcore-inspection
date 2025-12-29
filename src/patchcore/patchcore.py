@@ -10,15 +10,12 @@ import tqdm # 进度条
 import torch.utils.data
 
 import patchcore
-import patchcore.backbones
 import patchcore.common
-import patchcore.sampler
 import patchcore.vqvae_model
 
 # 获取日志记录器实例
 LOGGER = logging.getLogger(__name__)
 
-# 定义PatchCore类，继承module，是一个PyTorch模型
 class PatchCore(torch.nn.Module):
     # 构造函数，接受device参数
     def __init__(self, device):
@@ -42,13 +39,14 @@ class PatchCore(torch.nn.Module):
         vq_num_embeddings,
         vq_embedding_dim,
         vq_commitment_cost,
-        vq_aux_dim=0, # New parameter for multi-modal support
+        vq_use_ema_codebook=False,
+        vq_ema_decay=0.99,
+        vq_ema_eps=1e-5,
+        vq_backbone_name=None,
+        vq_layers_to_extract_from=None,
         # PatchCore Parameters
         patchsize=3,
         patchstride=1,
-        anomaly_score_num_nn=1,
-        featuresampler=patchcore.sampler.IdentitySampler(),
-        nn_method=patchcore.common.FaissNN(False, 4),
         vq_lr=1e-4,
         vq_epochs=10,
         **kwargs,
@@ -68,7 +66,13 @@ class PatchCore(torch.nn.Module):
             num_embeddings=vq_num_embeddings,
             embedding_dim=vq_embedding_dim,
             commitment_cost=vq_commitment_cost,
-            aux_dim=vq_aux_dim, # Pass aux_dim to VQVAE
+            use_ema_codebook=vq_use_ema_codebook,
+            ema_decay=vq_ema_decay,
+            ema_eps=vq_ema_eps,
+            backbone_name=vq_backbone_name,
+            layers_to_extract_from=vq_layers_to_extract_from,
+            device=device,
+            original_image_size=input_shape[-2:]
         ).to(device)
         self.forward_modules["vqvae_model"] = self.vqvae_model
 
@@ -78,31 +82,9 @@ class PatchCore(torch.nn.Module):
         self.vq_optimizer = torch.optim.Adam(self.vqvae_model.parameters(), lr=self.vq_lr)
         self.vq_loss_fn = F.mse_loss # Reconstruction loss
 
-        # 3. PatchCore Components (Simplified)
-        # The VQ-VAE output (quantized feature map) is the new feature source.
-        # We only need Aggregator and Scorer/Segmentor.
-
-        # The feature dimension is now VQ_EMBEDDING_DIM
-        feature_dimensions = [vq_embedding_dim]
-        
-        # We use VQ_EMBEDDING_DIM as the target dimension for the memory bank.
-        self.target_embed_dimension = vq_embedding_dim
-        
-        # We use a simplified Aggregator that just flattens the patches.
-        preadapt_aggregator = patchcore.common.Aggregator(
-            target_dim=vq_embedding_dim # Target dim is the embedding dim
-        )
-        _ = preadapt_aggregator.to(self.device)
-        self.forward_modules["preadapt_aggregator"] = preadapt_aggregator
-        
-        # 4. Anomaly Scorer and Segmentor
-        self.anomaly_scorer = patchcore.common.NearestNeighbourScorer(
-            n_nearest_neighbours=anomaly_score_num_nn, nn_method=nn_method
-        )
         self.anomaly_segmentor = patchcore.common.RescaleSegmentor(
             device=self.device, target_size=input_shape[-2:]
         )
-        self.featuresampler = featuresampler
 
     # 从输入数据提取特征嵌入
     def embed(self, data):
@@ -111,110 +93,60 @@ class PatchCore(torch.nn.Module):
             features = []
             for item in data:
                 image = item
-                aux_data = None
                 if isinstance(item, dict): # 如果输入是字典，提取图像张量和辅助数据
                     image = item["image"]
-                    aux_data = item.get("aux_data")
-                    if aux_data is not None:
-                        aux_data = aux_data.to(torch.float).to(self.device)
                         
                 with torch.no_grad():   # 禁用梯度计算，节省内存和计算资源
                     # 将图像移动到指定设备并转换为浮点类型
                     input_image = image.to(torch.float).to(self.device)
                     # 调用私有方法 _embed 提取特征，并添加到特征列表中
                     # _embed returns quantized features (NumPy array)
-                    quantized_features = self._embed(input_image, aux_data)
+                    quantized_features = self._embed(input_image)
                     features.append(quantized_features)
             return features
         
         # 如果输入不是DataLoader，直接调用 _embed 方法提取特征
-        # 假设直接输入只包含图像，或者用户在调用时提供了 aux_data
         quantized_features = self._embed(data)
         return quantized_features
     
     # _embed 方法实现了从输入图像中提取特征嵌入的具体逻辑
     '''形状为 [Batch_size, Channels, Height, Width]'''
-    def _embed(self, images, aux_data=None, detach=True, provide_patch_shapes=False):
-        """
-        Returns VQ-VAE outputs: quantized features, reconstruction, vq_loss, encoding_indices.
-        The quantized features are used as PatchCore features.
-        """
+    def _embed(self, images, detach=True, provide_patch_shapes=False):
 
-        def _detach(features):
-            if detach:
-                # features is a list containing one aggregated feature tensor.
-                # We return the single NumPy array.
-                return features[0].detach().cpu().numpy()
-            return features[0]
-        
-        # VQ-VAE is trained, so we set it to eval mode for feature extraction
         _ = self.vqvae_model.eval()
-        
-        # 1. VQ-VAE Forward Pass
-        x_recon, vq_loss, quantized_features, encoding_indices = self.vqvae_model(images, aux_data)
-        
-        # 2. Patchify the Quantized Features
-        # VQ-VAE output is [B, D, H/4, W/4]. We treat this as the feature map.
-        
-        # Patchify returns [N_total_patches, D, P, P] and spatial info [H_patches, W_patches]
-        features_and_shapes = self.patch_maker.patchify(
-            quantized_features, return_spatial_info=True
-        )
-        
-        features = [features_and_shapes[0]]
-        patch_shapes = [features_and_shapes[1]]
-        
-        # 3. Aggregate Patches (Flattening)
-        # features is a list containing one element: [N_total_patches, D, P, P]
-        # The Aggregator flattens the patch dimensions (P, P) and aggregates the list.
-        features = self.forward_modules["preadapt_aggregator"](features)
-        
-        # features is now [N_total_patches, D * P * P]
-        
-        # We return the quantized features (for memory bank) and the VQ-VAE outputs (for training/loss)
-        
-        if provide_patch_shapes:
-            # We detach the features for memory bank storage (NumPy array)
-            return _detach(features), patch_shapes, x_recon, vq_loss, encoding_indices
-        
-        # If not providing shapes, we return the features for memory bank construction
-        return _detach(features)
 
-    # memory bank的训练入口
+        # 现在 vqvae_model 额外返回 perplexity（codebook 使用度），便于上层监控
+        x_recon, vq_loss, perplexity, quantized_features, encoding_indices = self.vqvae_model(images)
+
+        return x_recon, vq_loss, perplexity, quantized_features, encoding_indices
+
     def fit(self, training_data):
-        """
-        VQ-VAE-PatchCore training.
-        1. Train VQ-VAE model (Encoder, Quantizer, Decoder) using reconstruction loss.
-        2. Compute quantized embeddings of the training data and fill the memory bank.
-        """
-        # 1. Train VQ-VAE
+        # Train VQ-VAE
         self._train_vqvae(training_data)
-        
-        # 2. Build Memory Bank
-        self._fill_memory_bank(training_data)
 
     def _train_vqvae(self, input_data):
         """Trains the VQ-VAE model using reconstruction and VQ losses."""
         self.vqvae_model.train()
         
+        self.perplexity_history = []  # 记录每个 epoch 的平均 perplexity，便于后续画曲线
+
         for epoch in range(self.vq_epochs):
             total_loss = 0
+            perplexities = []
             with tqdm.tqdm(
                 input_data, desc=f"VQ-VAE Training Epoch {epoch+1}/{self.vq_epochs}", leave=False
             ) as data_iterator:
                 for item in data_iterator:
                     image = item
-                    aux_data = None
                     if isinstance(item, dict):
                         image = item["image"]
-                        aux_data = item.get("aux_data")
-                        if aux_data is not None:
-                            aux_data = aux_data.to(torch.float).to(self.device)
-                    
+                    elif isinstance(item, (list, tuple)):
+                        image = item[0]
+
                     input_image = image.to(torch.float).to(self.device)
                     
                     # Forward pass
-                    x_recon, vq_loss, _, _ = self.vqvae_model(input_image, aux_data)
+                    x_recon, vq_loss, perplexity, _, _ = self.vqvae_model(input_image)
                     
                     # Calculate Reconstruction Loss (MSE)
                     recon_loss = self.vq_loss_fn(x_recon, input_image)
@@ -228,52 +160,25 @@ class PatchCore(torch.nn.Module):
                     self.vq_optimizer.step()
                     
                     total_loss += loss.item()
-            
-            LOGGER.info(f"VQ-VAE Epoch {epoch+1} finished. Avg Loss: {total_loss / len(input_data):.4f}")
+                    perplexities.append(perplexity.item())
 
+            avg_perplexity = sum(perplexities) / max(len(perplexities), 1)
+            self.perplexity_history.append(avg_perplexity)
+            LOGGER.info(
+                f"VQ-VAE Epoch {epoch+1} finished. "
+                f"Avg Loss: {total_loss / len(input_data):.4f}; "
+                f"Avg Perplexity: {avg_perplexity:.3f}"
+            )
 
-    def _fill_memory_bank(self, input_data):
-        """Computes and sets the support features for PatchCore memory bank."""
-        
-        # Set VQ-VAE to evaluation mode for feature extraction
-        self.vqvae_model.eval()
-
-        def _image_to_features(input_image):
-            # _embed returns quantized features (NumPy array) when provide_patch_shapes=False
-            quantized_features = self._embed(input_image)
-            return quantized_features
-
-        features = []
-        with torch.no_grad():
-            with tqdm.tqdm(
-                input_data, desc="Computing support features...", position=1, leave=False
-            ) as data_iterator:
-                for image in data_iterator:
-                    if isinstance(image, dict):
-                        image = image["image"]
-                    
-                    features.append(_image_to_features(image))
-        
-        # 沿着第0维连接所有图像的特征
-        features = np.concatenate(features, axis=0)
-        # 使用特征采样器对特征进行采样，减少记忆库大小
-        features = self.featuresampler.run(features)
-
-        # 确保 features 是 NumPy 数组，以满足 anomaly_scorer.fit 的类型要求
-        if not isinstance(features, np.ndarray):
-            features = features.cpu().numpy()
-
-        # 使用采样后的特征来拟合异常评分器
-        self.anomaly_scorer.fit(detection_features=[features])
-    
     # patchcore的推理入口
-    def predict(self, data):
+    def predict(self, data, return_recon=False):
         if isinstance(data, torch.utils.data.DataLoader):
-            return self._predict_dataloader(data)
-        return self._predict(data)
+            return self._predict_dataloader(data, return_recon=return_recon)
+
+        return self._predict(data, return_recon=return_recon)
     
     # 对整个数据加载器中的图像进行异常检测
-    def _predict_dataloader(self, dataloader):
+    def _predict_dataloader(self, dataloader, return_recon=False):
         """This function provides anomaly scores/maps for full dataloaders."""
         _ = self.forward_modules.eval()
 
@@ -281,6 +186,8 @@ class PatchCore(torch.nn.Module):
         masks = []          # 异常掩码
         labels_gt = []      # 真实标签
         masks_gt = []       # 真实掩码
+        reconstructions = []
+        inputs_raw = []
         with tqdm.tqdm(dataloader, desc="Inferring...", leave=False) as data_iterator:
             for image in data_iterator:
                 if isinstance(image, dict):
@@ -288,50 +195,44 @@ class PatchCore(torch.nn.Module):
                     labels_gt.extend(image["is_anomaly"].numpy().tolist())
                     masks_gt.extend(image["mask"].numpy().tolist())
                     image = image["image"]
-                # 获取图像的异常分数和掩码
-                _scores, _masks = self._predict(image)
+
+                if return_recon:
+                    _scores, _masks, _recons, _inputs = self._predict(image, return_recon=return_recon)
+                else:
+                    _scores, _masks = self._predict(image, return_recon=return_recon)
 
                 for score, mask in zip(_scores, _masks):
                     scores.append(score)
                     masks.append(mask)
+                if return_recon:
+                    reconstructions.extend(_recons)
+                    inputs_raw.extend(_inputs)
+        if return_recon:
+            return scores, masks, labels_gt, masks_gt, reconstructions, inputs_raw
         return scores, masks, labels_gt, masks_gt
 
     '''这后面的我看不懂'''
-    def _predict(self, images, aux_data=None):
-        """Infer score and mask for a batch of images."""
-        images = images.to(torch.float).to(self.device)
-        self.vqvae_model.eval() # Ensure VQ-VAE is in eval mode
-
-        batchsize = images.shape[0]
+    def _predict(self, images, return_recon=False):
+        input_images = images.to(torch.float).to(self.device)
+        self.vqvae_model.eval()
         with torch.no_grad():
-            # _embed returns quantized features (for memory bank), patch_shapes, x_recon, vq_loss, encoding_indices
-            features, patch_shapes, x_recon, vq_loss, encoding_indices = self._embed(
-                images, aux_data=aux_data, provide_patch_shapes=True
+            x_recon,_,_,_,_ = self._embed(images)
+
+            error_maps = F.mse_loss(x_recon, input_images, reduction="none")
+            anomaly_maps = torch.mean(error_maps, dim=1)
+            image_scores = anomaly_maps.amax(dim=(1,2))
+            anomaly_maps_np = anomaly_maps.cpu().numpy()
+            masks = self.anomaly_segmentor.convert_to_segmentation(anomaly_maps_np)
+
+        if return_recon:
+            return (
+                [score.item() for score in image_scores],
+                [mask for mask in masks],
+                [x.cpu() for x in x_recon],
+                [inp.cpu() for inp in input_images],
             )
-            # 将提取的特征转换为numpy数组
-            features = np.asarray(features)
 
-            # 使用anomaly_scorer对提取的补丁特征进行预测，计算每个补丁的异常分数
-            # [0] 表示只取第一个元素，即补丁分数
-            patch_scores = image_scores = self.anomaly_scorer.predict([features])[0]
-
-            # 将补丁分数重新组合成图像级别的异常分数和掩码
-            image_scores = self.patch_maker.unpatch_scores(
-                image_scores, batchsize=batchsize
-            )
-            image_scores = image_scores.reshape(*image_scores.shape[:2], -1)
-            image_scores = self.patch_maker.score(image_scores)
-
-            patch_scores = self.patch_maker.unpatch_scores(
-                patch_scores, batchsize=batchsize
-            )
-            scales = patch_shapes[0]
-            # 将补丁分数重塑为[B,H,W]
-            patch_scores = patch_scores.reshape(batchsize, scales[0], scales[1])
-
-            masks = self.anomaly_segmentor.convert_to_segmentation(patch_scores)
-
-        return [score for score in image_scores], [mask for mask in masks]
+        return [score.item()for score in image_scores], [mask for mask in masks]
 
     # 生成保存或加载模型参数的文件路径
     @staticmethod
@@ -341,21 +242,17 @@ class PatchCore(torch.nn.Module):
     # 保存PatchCore模型及其参数到指定路径
     def save_to_path(self, save_path: str, prepend: str = "") -> None:
         LOGGER.info("Saving PatchCore data.")
-        # 保存异常评分器的内部状态，不保存特征
-        self.anomaly_scorer.save(
-            save_path, save_features_separately=False, prepend=prepend
-        )
+        LOGGER.info("saving VQ-VAE data.")
         
         # 保存 VQ-VAE 模型参数
         vqvae_path = os.path.join(save_path, prepend + "vqvae_model.pth")
         torch.save(self.vqvae_model.state_dict(), vqvae_path)
         
-        # 创建字典，存储PatchCore的关键参数
+        # 创建字典，存储VQ-VAE的关键参数
         patchcore_params = {
             "input_shape": self.input_shape,
             "patchsize": self.patch_maker.patchsize,
             "patchstride": self.patch_maker.stride,
-            "anomaly_scorer_num_nn": self.anomaly_scorer.n_nearest_neighbours,
             # VQ-VAE parameters for reconstruction
             "vq_in_channels": self.vqvae_model.encoder.in_channels,
             "vq_out_channels": self.vqvae_model.decoder.out_channels,
@@ -365,7 +262,8 @@ class PatchCore(torch.nn.Module):
             "vq_num_embeddings": self.vqvae_model.quantizer.num_embeddings,
             "vq_embedding_dim": self.vqvae_model.quantizer.embedding_dim,
             "vq_commitment_cost": self.vqvae_model.quantizer.commitment_cost,
-            "vq_aux_dim": self.vqvae_model.encoder.aux_dim, # Save aux_dim
+            "vq_backbone_name": self.vqvae_model.encoder.backbone_name,
+            "vq_layers_to_extract_from": self.vqvae_model.encoder.layers_to_extract_from,
             "vq_lr": self.vq_lr,
             "vq_epochs": self.vq_epochs,
         }
@@ -377,22 +275,19 @@ class PatchCore(torch.nn.Module):
         self,
         load_path: str,
         device: torch.device,
-        nn_method,
         prepend: str = "",
     ) -> None:
-        LOGGER.info("Loading and initializing PatchCore.")
+        LOGGER.info("Loading and initializing VQ-VAE Anomaly Detection")
         # 打开参数文件，使用pickle反序列化参数字典
         with open(self._params_file(load_path, prepend), "rb") as load_file:
             patchcore_params = pickle.load(load_file)
         
         # Load VQ-VAE parameters and initialize model
-        self.load(**patchcore_params, device=device, nn_method=nn_method)
+        self.load(**patchcore_params, device=device)
         
         # Load VQ-VAE state dict
         vqvae_path = os.path.join(load_path, prepend + "vqvae_model.pth")
         self.vqvae_model.load_state_dict(torch.load(vqvae_path, map_location=device))
-
-        self.anomaly_scorer.load(load_path, prepend)
 
 
 # Image handling classes.
@@ -437,6 +332,8 @@ class PatchMaker:
         return unfolded_features
 
     def unpatch_scores(self, x, batchsize):
+        if isinstance(x, torch.Tensor):
+            x = x.cpu.numpy()
         return x.reshape(batchsize, -1, *x.shape[1:])
 
     def score(self, x):

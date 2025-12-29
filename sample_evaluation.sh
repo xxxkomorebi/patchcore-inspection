@@ -1,7 +1,7 @@
-datapath=/path/to/data/from/mvtec
-loadpath=/path/to/pretrained/patchcore/model
+datapath=mvtec
+loadpath=/models
 
-modelfolder=VQVAE_PC_IM320_S22_CPU # Use the VQ-VAE training group name
+modelfolder=VQVAE_PC_IM320_S22 # Use the VQ-VAE training group name
 # modelfolder=VQVAE_PC_IM224_S0_CPU
 savefolder=evaluated_results'/'$modelfolder
 
