@@ -220,7 +220,14 @@ class PatchCore(torch.nn.Module):
 
             error_maps = F.mse_loss(x_recon, input_images, reduction="none")
             anomaly_maps = torch.mean(error_maps, dim=1)
-            image_scores = anomaly_maps.amax(dim=(1,2))
+            # 原始最大值聚合（对噪声敏感）
+            # image_scores = anomaly_maps.amax(dim=(1,2))
+            # 分位数聚合（更稳健）
+            image_scores = torch.quantile(anomaly_maps.flatten(1), 0.995, dim=1)
+            # Top-k 均值聚合
+            # flat_scores = anomaly_maps.flatten(1)
+            # k = max(1, int(flat_scores.shape[1] * 0.01))  # top 1%
+            # image_scores = torch.topk(flat_scores, k, dim=1).values.mean(dim=1)
             anomaly_maps_np = anomaly_maps.cpu().numpy()
             masks = self.anomaly_segmentor.convert_to_segmentation(anomaly_maps_np)
 

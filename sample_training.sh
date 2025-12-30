@@ -8,12 +8,41 @@ dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '"${dataset}"; don
 ############# Detection
 # VQ-VAE-PatchCore: VQ-VAE Training (20 Epochs), Codebook: 512x64, Coreset Percentage: 10%, neighbours: 5, seed: 0
 # NOTE: This replaces the original PatchCore training command.
-python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_test_sample4 --log_project MPDD_sample results \
+python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e30 --log_project MPDD_sample results \
 patch_core \
     --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 512 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
-    --vq_lr 0.001 --vq_epochs 20 \
+    --vq_lr 0.001 --vq_epochs 30 \
     --patchsize 3 \
 dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
+
+# python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e40 --log_project MPDD_sample results \
+# patch_core \
+#     --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 512 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
+#     --vq_lr 0.001 --vq_epochs 40 \
+#     --patchsize 3 \
+# dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
+
+# python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e50 --log_project MPDD_sample results \
+# patch_core \
+#     --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 512 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
+#     --vq_lr 0.001 --vq_epochs 50 \
+#     --patchsize 3 \
+# dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
+
+# python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e60 --log_project MPDD_sample results \
+# patch_core \
+#     --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 512 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
+#     --vq_lr 0.001 --vq_epochs 60 \
+#     --patchsize 3 \
+# dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
+
+# python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e70 --log_project MPDD_sample results \
+# patch_core \
+#     --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 512 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
+#     --vq_lr 0.001 --vq_epochs 70 \
+#     --patchsize 3 \
+# dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
+
 
 #--vq_use_ema_codebook --vq_ema_decay 0.99 --vq_ema_eps 1e-5
 # Original Ensemble command removed for VQ-VAE integration.

@@ -195,14 +195,24 @@ class Decoder(nn.Module):
         # Initial feature mixing
         self.conv_in = nn.Conv2d(num_hiddens, num_hiddens, kernel_size=3, stride=1, padding=1)
 
-        # 不上采样的解码器，保持输入分辨率不变
-        self.conv_mid = nn.Conv2d(num_hiddens, num_hiddens // 2, kernel_size=3, stride=2, padding=1)
-        self.conv_out = nn.Conv2d(num_hiddens // 2, out_channels, kernel_size=3, stride=2, padding=1)
+        # PixelShuffle 上采样链，总放大 4x（适配 /4 下采样特征）
+        self.ps1 = nn.Sequential(
+            nn.Conv2d(num_hiddens, num_hiddens * 4, kernel_size=3, stride=1, padding=1),
+            nn.PixelShuffle(2),
+            nn.ReLU(inplace=True),
+        )
+        self.ps2 = nn.Sequential(
+            nn.Conv2d(num_hiddens, (num_hiddens // 2) * 4, kernel_size=3, stride=1, padding=1),
+            nn.PixelShuffle(2),
+            nn.ReLU(inplace=True),
+        )
+        self.conv_out = nn.Conv2d(num_hiddens // 2, out_channels, kernel_size=3, stride=1, padding=1)
         self.output_act = nn.Identity()
 
     def forward(self, x):
         h = F.relu(self.conv_in(x))
-        h = F.relu(self.conv_mid(h))
+        h = self.ps1(h)
+        h = self.ps2(h)
         out = self.conv_out(h)
         return self.output_act(out) # Output reconstruction [B, out_channels, H, W]
 

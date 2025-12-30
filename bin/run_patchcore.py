@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import PIL.Image
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import patchcore.common
 import patchcore.metrics
@@ -20,8 +22,9 @@ LOGGER = logging.getLogger(__name__)
 
 _DATASETS = {
     "mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"],
-    "mpdd":["patchcore.datasets.mpdd", "MPDDDataset"]
-    }
+    "mpdd": ["patchcore.datasets.mpdd", "MPDDDataset"],
+    "cardd": ["patchcore.datasets.cardd", "CarDDDataset"],
+}
 
 
 @click.group(chain=True)
