@@ -69,7 +69,10 @@ class VectorQuantizer(nn.Module):
         # Reshape back to [B, C, H, W]
         quantized = quantized.permute(0, 3, 1, 2).contiguous()
 
-        return quantized, loss, perplexity, encoding_indices.view(input_shape[:-1])
+        # Active code ratio (optional diagnostic)
+        active_code_ratio = (encodings.sum(dim=0) > 0).float().mean()
+
+        return quantized, loss, perplexity, encoding_indices.view(input_shape[:-1]), active_code_ratio
 
 class EMAVectorQuantizer(nn.Module):
     """
@@ -136,7 +139,10 @@ class EMAVectorQuantizer(nn.Module):
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
-        return quantized, loss, perplexity, encoding_indices.view(inputs.shape[0], *inputs.shape[2:])
+        # Active code ratio (optional diagnostic)
+        active_code_ratio = (encodings.sum(dim=0) > 0).float().mean()
+
+        return quantized, loss, perplexity, encoding_indices.view(inputs.shape[0], *inputs.shape[2:]), active_code_ratio
 
 class Encoder(nn.Module):
     """
@@ -262,7 +268,7 @@ class VQVAE(nn.Module):
         z_e = self.pre_quantization_conv(z_e)
         
         # 3. Quantize
-        quantized, vq_loss, perplexity, encoding_indices = self.quantizer(z_e)
+        quantized, vq_loss, perplexity, encoding_indices, active_code_ratio = self.quantizer(z_e)
         
         # 4. Post-quantization convolution (map embedding dimension back to hidden channels)
         quantized_h = self.post_quantization_conv(quantized)
@@ -275,5 +281,8 @@ class VQVAE(nn.Module):
                 x_recon, size=x.shape[-2:], mode="bilinear", align_corners=False
             )
 
+        # 量化距离（用于 anomaly map）
+        quantization_error = F.mse_loss(quantized, z_e, reduction="none").mean(dim=1)
+
         # 返回 perplexity 便于监控 codebook 使用情况
-        return x_recon, vq_loss, perplexity, quantized, encoding_indices
+        return x_recon, vq_loss, perplexity, quantized, encoding_indices, quantization_error, active_code_ratio

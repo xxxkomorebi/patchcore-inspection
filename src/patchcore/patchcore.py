@@ -115,10 +115,10 @@ class PatchCore(torch.nn.Module):
 
         _ = self.vqvae_model.eval()
 
-        # 现在 vqvae_model 额外返回 perplexity（codebook 使用度），便于上层监控
-        x_recon, vq_loss, perplexity, quantized_features, encoding_indices = self.vqvae_model(images)
+        # 现在 vqvae_model 额外返回 perplexity、量化距离图与 active code 比例
+        x_recon, vq_loss, perplexity, quantized_features, encoding_indices, quantization_error, active_code_ratio = self.vqvae_model(images)
 
-        return x_recon, vq_loss, perplexity, quantized_features, encoding_indices
+        return x_recon, vq_loss, perplexity, quantized_features, encoding_indices, quantization_error, active_code_ratio
 
     def fit(self, training_data):
         # Train VQ-VAE
@@ -133,6 +133,7 @@ class PatchCore(torch.nn.Module):
         for epoch in range(self.vq_epochs):
             total_loss = 0
             perplexities = []
+            active_ratios = []
             with tqdm.tqdm(
                 input_data, desc=f"VQ-VAE Training Epoch {epoch+1}/{self.vq_epochs}", leave=False
             ) as data_iterator:
@@ -146,7 +147,7 @@ class PatchCore(torch.nn.Module):
                     input_image = image.to(torch.float).to(self.device)
                     
                     # Forward pass
-                    x_recon, vq_loss, perplexity, _, _ = self.vqvae_model(input_image)
+                    x_recon, vq_loss, perplexity, _, _, _, active_code_ratio = self.vqvae_model(input_image)
                     
                     # Calculate Reconstruction Loss (MSE)
                     recon_loss = self.vq_loss_fn(x_recon, input_image)
@@ -161,13 +162,16 @@ class PatchCore(torch.nn.Module):
                     
                     total_loss += loss.item()
                     perplexities.append(perplexity.item())
+                    active_ratios.append(active_code_ratio.item())
 
             avg_perplexity = sum(perplexities) / max(len(perplexities), 1)
+            avg_active_ratio = sum(active_ratios) / max(len(active_ratios), 1)
             self.perplexity_history.append(avg_perplexity)
             LOGGER.info(
                 f"VQ-VAE Epoch {epoch+1} finished. "
                 f"Avg Loss: {total_loss / len(input_data):.4f}; "
-                f"Avg Perplexity: {avg_perplexity:.3f}"
+                f"Avg Perplexity: {avg_perplexity:.3f}; "
+                f"Active Code Ratio: {avg_active_ratio:.3f}"
             )
 
     # patchcore的推理入口
@@ -216,18 +220,20 @@ class PatchCore(torch.nn.Module):
         input_images = images.to(torch.float).to(self.device)
         self.vqvae_model.eval()
         with torch.no_grad():
-            x_recon,_,_,_,_ = self._embed(images)
+            x_recon,_,_,_,_, quantization_error, _ = self._embed(images)
 
             error_maps = F.mse_loss(x_recon, input_images, reduction="none")
-            anomaly_maps = torch.mean(error_maps, dim=1)
+            anomaly_maps = torch.mean(error_maps, dim=1) # 恢复仅使用重建误差
+
+            # 三种聚合方式计算图像级异常分数
             # 原始最大值聚合（对噪声敏感）
             # image_scores = anomaly_maps.amax(dim=(1,2))
             # 分位数聚合（更稳健）
-            image_scores = torch.quantile(anomaly_maps.flatten(1), 0.995, dim=1)
+            # image_scores = torch.quantile(anomaly_maps.flatten(1), 0.999, dim=1)
             # Top-k 均值聚合
-            # flat_scores = anomaly_maps.flatten(1)
-            # k = max(1, int(flat_scores.shape[1] * 0.01))  # top 1%
-            # image_scores = torch.topk(flat_scores, k, dim=1).values.mean(dim=1)
+            flat_scores = anomaly_maps.flatten(1)
+            k = max(1, int(flat_scores.shape[1] * 0.001))  # top 0.1%
+            image_scores = torch.topk(flat_scores, k, dim=1).values.mean(dim=1)
             anomaly_maps_np = anomaly_maps.cpu().numpy()
             masks = self.anomaly_segmentor.convert_to_segmentation(anomaly_maps_np)
 

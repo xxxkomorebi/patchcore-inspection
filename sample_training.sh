@@ -8,12 +8,23 @@ dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '"${dataset}"; don
 ############# Detection
 # VQ-VAE-PatchCore: VQ-VAE Training (20 Epochs), Codebook: 512x64, Coreset Percentage: 10%, neighbours: 5, seed: 0
 # NOTE: This replaces the original PatchCore training command.
-python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e30 --log_project MPDD_sample results \
+python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e20_topk0.001 --log_project MPDD_sample results \
 patch_core \
-    --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 512 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
-    --vq_lr 0.001 --vq_epochs 30 \
+    --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 32 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
+    --vq_lr 0.001 --vq_epochs 20 \
     --patchsize 3 \
 dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
+
+# vq_num_hiddens 编码器解码器的主干通道数
+# --vq_num_embeddings codebook 大小（码本向量数 K）
+# vq_embedding_dim 码本向量的维度 D
+# --vq_commitment_cost 损失函数中承诺损失的权重 β
+# --vq_lr 学习率
+# --vq_epochs 训练轮数
+# patchsize 3 patch补丁大小
+
+# resize 先把图像缩放到256，再裁剪到imagesize 224
+
 
 # python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e40 --log_project MPDD_sample results \
 # patch_core \
