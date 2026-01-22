@@ -217,23 +217,57 @@ class PatchCore(torch.nn.Module):
 
     '''这后面的我看不懂'''
     def _predict(self, images, return_recon=False):
+        # 1. 准备数据
         input_images = images.to(torch.float).to(self.device)
         self.vqvae_model.eval()
+        
         with torch.no_grad():
-            x_recon,_,_,_,_, quantization_error, _ = self._embed(images)
+            # 2. 获取重建图
+            x_recon, _, _, _, _, quantization_error, _ = self._embed(images)
 
-            error_maps = F.mse_loss(x_recon, input_images, reduction="none")
-            anomaly_maps = torch.mean(error_maps, dim=1) # 恢复仅使用重建误差
+            # ==========================================
+            # === 核心修改：使用 梯度损失 + L1 损失 ===
+            # ==========================================
 
-            # 三种聚合方式计算图像级异常分数
-            # 原始最大值聚合（对噪声敏感）
-            # image_scores = anomaly_maps.amax(dim=(1,2))
-            # 分位数聚合（更稳健）
-            # image_scores = torch.quantile(anomaly_maps.flatten(1), 0.999, dim=1)
-            # Top-k 均值聚合
+            # --- A. 像素级误差 (改用 L1，比 MSE 对光照更鲁棒) ---
+            # reduction='none' 也就是保留 [B, C, H, W]
+            # mean(dim=1) 把通道平均掉 -> [B, H, W]
+            pixel_loss = torch.mean(torch.abs(x_recon - input_images), dim=1)
+
+            # --- B. 梯度损失 (Gradient Loss) ---
+            # 定义计算梯度的函数 (计算相邻像素的差值，即边缘)
+            def compute_gradient(img):
+                # 沿 X 轴差分
+                gx = img[:, :, :, :-1] - img[:, :, :, 1:]
+                # 沿 Y 轴差分
+                gy = img[:, :, :-1, :] - img[:, :, 1:, :]
+                # 补齐尺寸 (Padding)，保持和原图一样大
+                gx = F.pad(gx, (0, 1, 0, 0), mode='replicate')
+                gy = F.pad(gy, (0, 0, 0, 1), mode='replicate')
+                return gx, gy
+
+            # 计算原图和重建图的梯度
+            gx_in, gy_in = compute_gradient(input_images)
+            gx_rec, gy_rec = compute_gradient(x_recon)
+
+            # 计算梯度差异 (边缘对不上的程度)
+            grad_error_x = torch.mean(torch.abs(gx_in - gx_rec), dim=1)
+            grad_error_y = torch.mean(torch.abs(gy_in - gy_rec), dim=1)
+            grad_loss = grad_error_x + grad_error_y
+
+            # --- C. 融合异常图 ---
+            # 梯度误差通常数值很小，给它加权 (例如 5.0 倍)
+            # 这样模型主要关注“边缘有没有对上”，而不是“亮度有没有对上”
+            anomaly_maps = pixel_loss + 5.0 * grad_loss
+            
+            # ==========================================
+
+            # 后续处理逻辑保持不变
             flat_scores = anomaly_maps.flatten(1)
-            k = max(1, int(flat_scores.shape[1] * 0.001))  # top 0.1%
+            # 使用 Top-K 平均值作为图片级分数
+            k = max(1, int(flat_scores.shape[1] * 0.001))
             image_scores = torch.topk(flat_scores, k, dim=1).values.mean(dim=1)
+            
             anomaly_maps_np = anomaly_maps.cpu().numpy()
             masks = self.anomaly_segmentor.convert_to_segmentation(anomaly_maps_np)
 
@@ -245,7 +279,39 @@ class PatchCore(torch.nn.Module):
                 [inp.cpu() for inp in input_images],
             )
 
-        return [score.item()for score in image_scores], [mask for mask in masks]
+        return [score.item() for score in image_scores], [mask for mask in masks]
+    
+    #def _predict(self, images, return_recon=False):
+        
+    #     input_images = images.to(torch.float).to(self.device)
+    #     self.vqvae_model.eval()
+    #     with torch.no_grad():
+    #         x_recon,_,_,_,_, quantization_error, _ = self._embed(images)
+
+    #         error_maps = F.mse_loss(x_recon, input_images, reduction="none")
+    #         anomaly_maps = torch.mean(error_maps, dim=1) # 恢复仅使用重建误差
+
+    #         # 三种聚合方式计算图像级异常分数
+    #         # 原始最大值聚合（对噪声敏感）
+    #         # image_scores = anomaly_maps.amax(dim=(1,2))
+    #         # 分位数聚合（更稳健）
+    #         # image_scores = torch.quantile(anomaly_maps.flatten(1), 0.999, dim=1)
+    #         # Top-k 均值聚合
+    #         flat_scores = anomaly_maps.flatten(1)
+    #         k = max(1, int(flat_scores.shape[1] * 0.001))  # top 0.1%
+    #         image_scores = torch.topk(flat_scores, k, dim=1).values.mean(dim=1)
+    #         anomaly_maps_np = anomaly_maps.cpu().numpy()
+    #         masks = self.anomaly_segmentor.convert_to_segmentation(anomaly_maps_np)
+
+    #     if return_recon:
+    #         return (
+    #             [score.item() for score in image_scores],
+    #             [mask for mask in masks],
+    #             [x.cpu() for x in x_recon],
+    #             [inp.cpu() for inp in input_images],
+    #         )
+
+    #     return [score.item()for score in image_scores], [mask for mask in masks]
 
     # 生成保存或加载模型参数的文件路径
     @staticmethod

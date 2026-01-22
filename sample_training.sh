@@ -1,17 +1,18 @@
 export PYTHONPATH=src
-datapath=MPDD
-#datasets=('carpet')
-datasets=('bracket_black' 'bracket_brown' 'bracket_white' 'connector' 'metal_plate' 'tubes')
-# datasets=('bottle' 'cable'  'capsule'  'carpet'  'grid'  'hazelnut' 'leather'  'metal_nut'  'pill' 'screw' 'tile' 'toothbrush' 'transistor' 'wood' 'zipper')
+datapath=MVTec
+# datasets=('carpet')
+# datasets=('bracket_black' 'bracket_brown' 'bracket_white' 'metal_plate' 'tubes')
+datasets=('bottle' 'cable'  'capsule'  'carpet'  'grid'  'hazelnut' 'leather'  'metal_nut'  'pill' 'screw' 'tile' 'toothbrush' 'transistor' 'wood' 'zipper')
 dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '"${dataset}"; done))
 
 ############# Detection
 # VQ-VAE-PatchCore: VQ-VAE Training (20 Epochs), Codebook: 512x64, Coreset Percentage: 10%, neighbours: 5, seed: 0
 # NOTE: This replaces the original PatchCore training command.
-python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e20_topk0.001 --log_project MPDD_sample results \
+python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_sample4_e20_topk0.001_BN_128128 --log_project MVTec_sample results \
 patch_core \
-    --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 32 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
+    --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 128 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
     --vq_lr 0.001 --vq_epochs 20 \
+    --vq_use_ema_codebook --vq_ema_decay 0.99 --vq_ema_eps 1e-5 \
     --patchsize 3 \
 dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
 
@@ -22,7 +23,8 @@ dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
 # --vq_lr 学习率
 # --vq_epochs 训练轮数
 # patchsize 3 patch补丁大小
-
+#--vq_backbone_name resnet50 \
+# --vq_layers_to_extract_from layer1 --vq_layers_to_extract_from layer2 \
 # resize 先把图像缩放到256，再裁剪到imagesize 224
 
 

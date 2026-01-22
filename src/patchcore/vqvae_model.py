@@ -163,15 +163,50 @@ class Encoder(nn.Module):
             self.feature_extractor = NetworkFeatureAggregator(
                 backbone, layers_to_extract_from, device
             )
-            self.out_channels = self.feature_extractor.feature_dimensions([in_channels, 256, 256])[-1]
+            with torch.no_grad():
+                # 计算输出通道数
+                dummy_input = torch.zeros(1, in_channels, 224, 224).to(device)
+                features = self.feature_extractor(dummy_input)
+            total_channels = 0
+            for layer in layers_to_extract_from:
+                total_channels += features[layer].shape[1]
+            self.out_channels = total_channels
             self.projection = nn.Identity()
-            # 这里的self.out_channels将是backbone输出的通道数，VQVAE的num_hiddens需要与此匹配
         else:
-            # 使用卷积网络
-            self.conv_in = nn.Conv2d(in_channels, num_hiddens // 2, kernel_size=4, stride=2, padding=1)
-            self.conv_mid = nn.Conv2d(num_hiddens // 2, num_hiddens, kernel_size=4, stride=2, padding=1)
+
+            #leyer1: 下采样 /2
+            self.block1 = nn.Sequential(
+                nn.Conv2d(in_channels, num_hiddens // 2, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(num_hiddens // 2),
+                nn.ReLU(inplace=True)
+            )
+            self.block2 = nn.Sequential(
+                nn.Conv2d(num_hiddens // 2, num_hiddens, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(num_hiddens),
+                nn.ReLU(inplace=True)
+            )
+            self.block3 = nn.Sequential(
+                nn.Conv2d(num_hiddens, num_hiddens, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(num_hiddens),
+                nn.ReLU(inplace=True)
+            )
             self.conv_out = nn.Conv2d(num_hiddens, num_hiddens, kernel_size=3, stride=1, padding=1)
-            self.out_channels = num_hiddens
+
+            # # 使用三层卷积网络
+            # self.conv_in = nn.Conv2d(in_channels, num_hiddens // 2, kernel_size=4, stride=2, padding=1)
+            # self.conv_mid = nn.Conv2d(num_hiddens // 2, num_hiddens, kernel_size=4, stride=2, padding=1)
+            # self.conv_out = nn.Conv2d(num_hiddens, num_hiddens, kernel_size=3, stride=1, padding=1)
+            
+            if self.layers_to_extract_from:
+                total_channels = 0
+                for layer_idx in self.layers_to_extract_from:
+                    if str(layer_idx) == '1':
+                        total_channels += num_hiddens // 2
+                    elif str(layer_idx) in ['2', '3']:
+                        total_channels += num_hiddens
+                self.out_channels = total_channels
+            else:
+                self.out_channels = num_hiddens
 
     def forward(self, x):
         # 始终与模块当前所在设备对齐，避免 self.device 过期导致 CPU/GPU 混用
@@ -179,15 +214,40 @@ class Encoder(nn.Module):
         x = x.to(device)
         if self.backbone_name:
             features = self.feature_extractor(x)
-            # 提取最后一个指定层的特征
-            # 由于VQ-VAE的encoder期望一个单一的特征图输出，我们取最后一个提取的层
-            h = features[self.layers_to_extract_from[-1]]
-            h = self.projection(h)
-            return h
+            layers_to_process = [features[layer] for layer in self.layers_to_extract_from]
+            
         else:
-            h = F.relu(self.conv_in(x))
-            h = F.relu(self.conv_mid(h))
-            return self.conv_out(h)
+            f1 = self.block1(x)  # Layer 1
+            f2 = self.block2(f1) # Layer 2
+            f3 = self.block3(f2) # Layer 3
+            f4 = self.conv_out(f3) # Layer 4
+            # f1 = F.relu(self.conv_in(x))      # Layer 1
+            # f2 = F.relu(self.conv_mid(f1))    # Layer 2
+            # f3 = self.conv_out(f2)            # Layer 3
+        
+            if not self.layers_to_extract_from:
+                return f4
+            
+            # 收集需要的层
+            features = {"1":f1, "2":f2, "3":f3, "4":f4}
+            layers_to_process = [features[str(layer)] for layer in self.layers_to_extract_from]
+        
+        if len(layers_to_process) > 1:
+            target_size = layers_to_process[0].shape[-2:]
+            
+            fused_features = []
+            for feature in layers_to_process:
+                if feature.shape[-2:] != target_size:
+                    feature = F.interpolate(
+                        feature, size=target_size, mode="bilinear", align_corners=False
+                    )
+                fused_features.append(feature)
+            
+            h = torch.cat(fused_features, dim=1)
+        else:
+            h = layers_to_process[0]
+
+        return h
 
 class Decoder(nn.Module):
     """
@@ -213,7 +273,7 @@ class Decoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.conv_out = nn.Conv2d(num_hiddens // 2, out_channels, kernel_size=3, stride=1, padding=1)
-        self.output_act = nn.Identity()
+        self.output_act = nn.Identity()  
 
     def forward(self, x):
         h = F.relu(self.conv_in(x))
@@ -246,8 +306,14 @@ class VQVAE(nn.Module):
             # 强制VQVAE的num_hiddens与encoder_out_channels匹配
             num_hiddens = encoder_out_channels
         else:
-            self.encoder = Encoder(in_channels, num_hiddens)
-            encoder_out_channels = num_hiddens
+            self.encoder = Encoder(
+                in_channels,
+                num_hiddens,
+                backbone_name=None,
+                layers_to_extract_from=layers_to_extract_from,
+                device=device
+                )
+            encoder_out_channels = self.encoder.out_channels
 
         self.pre_quantization_conv = nn.Conv2d(encoder_out_channels, embedding_dim, kernel_size=1, stride=1)
 

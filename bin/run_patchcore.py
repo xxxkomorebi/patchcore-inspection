@@ -172,34 +172,34 @@ def run(
                 ]
 
             if save_segmentation_images:
-                def image_transform(image):
-                    in_std = np.array(
-                        dataloaders["testing"].dataset.transform_std
-                    ).reshape(-1, 1, 1)
-                    in_mean = np.array(
-                        dataloaders["testing"].dataset.transform_mean
-                    ).reshape(-1, 1, 1)
-                    image = dataloaders["testing"].dataset.transform_img(image)
-                    return np.clip(
-                        (image.numpy() * in_std + in_mean) * 255, 0, 255
-                    ).astype(np.uint8)
+                # def image_transform(image):
+                #     in_std = np.array(
+                #         dataloaders["testing"].dataset.transform_std
+                #     ).reshape(-1, 1, 1)
+                #     in_mean = np.array(
+                #         dataloaders["testing"].dataset.transform_mean
+                #     ).reshape(-1, 1, 1)
+                #     image = dataloaders["testing"].dataset.transform_img(image)
+                #     return np.clip(
+                #         (image.numpy() * in_std + in_mean) * 255, 0, 255
+                #     ).astype(np.uint8)
 
-                def mask_transform(mask):
-                    return dataloaders["testing"].dataset.transform_mask(mask).numpy()
+                # def mask_transform(mask):
+                #     return dataloaders["testing"].dataset.transform_mask(mask).numpy()
 
-                image_save_path = os.path.join(
-                    run_save_path, "segmentation_images", dataset_name
-                )
-                os.makedirs(image_save_path, exist_ok=True)
-                patchcore.utils.plot_segmentation_images(
-                    image_save_path,
-                    image_paths,
-                    segmentations,
-                    scores,
-                    mask_paths,
-                    image_transform=image_transform,
-                    mask_transform=mask_transform,
-                )
+                # image_save_path = os.path.join(
+                #     run_save_path, "segmentation_images", dataset_name
+                # )
+                # os.makedirs(image_save_path, exist_ok=True)
+                # patchcore.utils.plot_segmentation_images(
+                #     image_save_path,
+                #     image_paths,
+                #     segmentations,
+                #     scores,
+                #     mask_paths,
+                #     image_transform=image_transform,
+                #     mask_transform=mask_transform,
+                # )
 
                 # 若需要重建图，可在此同时保存重建和分割可视化
                 if len(recon_collector) > 0:
