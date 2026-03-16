@@ -6,12 +6,36 @@ import pickle
 import numpy as np
 import torch
 import torch.nn.functional as F
+from skimage.metrics import structural_similarity as ssim
 import tqdm # 进度条
 import torch.utils.data
 
 import patchcore
 import patchcore.common
 import patchcore.vqvae_model
+
+# MAD calculation
+def calculate_mad_map(original_latent, reconstructed_latent):
+    abs_diff = torch.abs(original_latent - reconstructed_latent)
+    mad_map = torch.mean(abs_diff, dim=1)
+    return mad_map
+
+# SSIM calculation (pixel-wise map)
+def calculate_ssim_map(original_image, reconstructed_image):
+    ssim_maps = []
+    for i in range(original_image.shape[0]):
+        img_np = original_image[i].permute(1, 2, 0).cpu().numpy()
+        recon_np = reconstructed_image[i].permute(1, 2, 0).cpu().numpy()
+        
+        # full=True returns the SSIM map, data_range=1.0 for [0,1] images
+        _, ssim_map_i = ssim(img_np, recon_np, data_range=1.0, channel_axis=-1, full=True)
+        # skimage may return [H, W, C] for multichannel; reduce to [H, W]
+        if ssim_map_i.ndim == 3:
+            ssim_map_i = ssim_map_i.mean(axis=-1)
+        ssim_maps.append(torch.from_numpy(ssim_map_i).to(original_image.device))
+            
+    ssim_maps_torch = torch.stack(ssim_maps)
+    return ssim_maps_torch
 
 # 获取日志记录器实例
 LOGGER = logging.getLogger(__name__)
@@ -22,7 +46,6 @@ class PatchCore(torch.nn.Module):
         """PatchCore anomaly detection class."""
         # 调用父类的构造函数，进行初始化
         super(PatchCore, self).__init__()
-        # 将device参数赋值给实例变量
         self.device = device
     
     # 初始化和配置PatchCore模型的所有组件
@@ -44,6 +67,8 @@ class PatchCore(torch.nn.Module):
         vq_ema_eps=1e-5,
         vq_backbone_name=None,
         vq_layers_to_extract_from=None,
+        vq_use_fsq=False,
+        vq_fsq_levels=None,
         # PatchCore Parameters
         patchsize=3,
         patchstride=1,
@@ -72,7 +97,9 @@ class PatchCore(torch.nn.Module):
             backbone_name=vq_backbone_name,
             layers_to_extract_from=vq_layers_to_extract_from,
             device=device,
-            original_image_size=input_shape[-2:]
+            original_image_size=input_shape[-2:],
+            use_fsq=vq_use_fsq,
+            fsq_levels=vq_fsq_levels,
         ).to(device)
         self.forward_modules["vqvae_model"] = self.vqvae_model
 
@@ -110,15 +137,16 @@ class PatchCore(torch.nn.Module):
         return quantized_features
     
     # _embed 方法实现了从输入图像中提取特征嵌入的具体逻辑
-    '''形状为 [Batch_size, Channels, Height, Width]'''
+    
     def _embed(self, images, detach=True, provide_patch_shapes=False):
 
         _ = self.vqvae_model.eval()
 
         # 现在 vqvae_model 额外返回 perplexity、量化距离图与 active code 比例
-        x_recon, vq_loss, perplexity, quantized_features, encoding_indices, quantization_error, active_code_ratio = self.vqvae_model(images)
+        x_recon, vq_loss, perplexity, z_e, quantized_features, encoding_indices, quantization_error, active_code_ratio = self.vqvae_model(images)
 
-        return x_recon, vq_loss, perplexity, quantized_features, encoding_indices, quantization_error, active_code_ratio
+
+        return x_recon, vq_loss, perplexity, z_e, quantized_features, encoding_indices, quantization_error, active_code_ratio
 
     def fit(self, training_data):
         # Train VQ-VAE
@@ -147,7 +175,7 @@ class PatchCore(torch.nn.Module):
                     input_image = image.to(torch.float).to(self.device)
                     
                     # Forward pass
-                    x_recon, vq_loss, perplexity, _, _, _, active_code_ratio = self.vqvae_model(input_image)
+                    x_recon, vq_loss, perplexity, _, _, _, _, active_code_ratio = self.vqvae_model(input_image)
                     
                     # Calculate Reconstruction Loss (MSE)
                     recon_loss = self.vq_loss_fn(x_recon, input_image)
@@ -208,14 +236,13 @@ class PatchCore(torch.nn.Module):
                 for score, mask in zip(_scores, _masks):
                     scores.append(score)
                     masks.append(mask)
-                if return_recon:
+                if return_recon: # Corrected from 'if return_recon):'
                     reconstructions.extend(_recons)
                     inputs_raw.extend(_inputs)
         if return_recon:
             return scores, masks, labels_gt, masks_gt, reconstructions, inputs_raw
         return scores, masks, labels_gt, masks_gt
 
-    '''这后面的我看不懂'''
     def _predict(self, images, return_recon=False):
         # 1. 准备数据
         input_images = images.to(torch.float).to(self.device)
@@ -223,45 +250,26 @@ class PatchCore(torch.nn.Module):
         
         with torch.no_grad():
             # 2. 获取重建图
-            x_recon, _, _, _, _, quantization_error, _ = self._embed(images)
+            x_recon, _, _, z_e, quantized_features, _, _, _ = self._embed(images)
 
-            # ==========================================
-            # === 核心修改：使用 梯度损失 + L1 损失 ===
-            # ==========================================
-
-            # --- A. 像素级误差 (改用 L1，比 MSE 对光照更鲁棒) ---
-            # reduction='none' 也就是保留 [B, C, H, W]
-            # mean(dim=1) 把通道平均掉 -> [B, H, W]
-            pixel_loss = torch.mean(torch.abs(x_recon - input_images), dim=1)
-
-            # --- B. 梯度损失 (Gradient Loss) ---
-            # 定义计算梯度的函数 (计算相邻像素的差值，即边缘)
-            def compute_gradient(img):
-                # 沿 X 轴差分
-                gx = img[:, :, :, :-1] - img[:, :, :, 1:]
-                # 沿 Y 轴差分
-                gy = img[:, :, :-1, :] - img[:, :, 1:, :]
-                # 补齐尺寸 (Padding)，保持和原图一样大
-                gx = F.pad(gx, (0, 1, 0, 0), mode='replicate')
-                gy = F.pad(gy, (0, 0, 0, 1), mode='replicate')
-                return gx, gy
-
-            # 计算原图和重建图的梯度
-            gx_in, gy_in = compute_gradient(input_images)
-            gx_rec, gy_rec = compute_gradient(x_recon)
-
-            # 计算梯度差异 (边缘对不上的程度)
-            grad_error_x = torch.mean(torch.abs(gx_in - gx_rec), dim=1)
-            grad_error_y = torch.mean(torch.abs(gy_in - gy_rec), dim=1)
-            grad_loss = grad_error_x + grad_error_y
-
-            # --- C. 融合异常图 ---
-            # 梯度误差通常数值很小，给它加权 (例如 5.0 倍)
-            # 这样模型主要关注“边缘有没有对上”，而不是“亮度有没有对上”
-            anomaly_maps = pixel_loss + 5.0 * grad_loss
+            # 1. Calculate MAD Map (on latent space)
+            mad_map = calculate_mad_map(z_e, quantized_features) # [B, H_latent, W_latent]
             
-            # ==========================================
-
+            # 2. Calculate SSIM Map (on image space)
+            # Ensure x_recon and input_images are in the correct range [0,1] for SSIM
+            # Assuming they are already in [0,1]
+            ssim_map = calculate_ssim_map(input_images, x_recon) # [B, H, W]
+            
+            # Upsample mad_map to match ssim_map size if different
+            if mad_map.shape[-2:] != ssim_map.shape[-2:]:
+                mad_map = F.interpolate(mad_map.unsqueeze(1), size=ssim_map.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
+            
+            # 3. Combine MAD and SSIM maps (element-wise multiplication)
+            # User requested MAD ⊗ SM. Assuming SM_anomaly = 1 - SSIM_similarity
+            combined_anomaly_maps = mad_map * (1 - ssim_map)
+            
+            anomaly_maps = combined_anomaly_maps
+            
             # 后续处理逻辑保持不变
             flat_scores = anomaly_maps.flatten(1)
             # 使用 Top-K 平均值作为图片级分数
@@ -281,38 +289,6 @@ class PatchCore(torch.nn.Module):
 
         return [score.item() for score in image_scores], [mask for mask in masks]
     
-    #def _predict(self, images, return_recon=False):
-        
-    #     input_images = images.to(torch.float).to(self.device)
-    #     self.vqvae_model.eval()
-    #     with torch.no_grad():
-    #         x_recon,_,_,_,_, quantization_error, _ = self._embed(images)
-
-    #         error_maps = F.mse_loss(x_recon, input_images, reduction="none")
-    #         anomaly_maps = torch.mean(error_maps, dim=1) # 恢复仅使用重建误差
-
-    #         # 三种聚合方式计算图像级异常分数
-    #         # 原始最大值聚合（对噪声敏感）
-    #         # image_scores = anomaly_maps.amax(dim=(1,2))
-    #         # 分位数聚合（更稳健）
-    #         # image_scores = torch.quantile(anomaly_maps.flatten(1), 0.999, dim=1)
-    #         # Top-k 均值聚合
-    #         flat_scores = anomaly_maps.flatten(1)
-    #         k = max(1, int(flat_scores.shape[1] * 0.001))  # top 0.1%
-    #         image_scores = torch.topk(flat_scores, k, dim=1).values.mean(dim=1)
-    #         anomaly_maps_np = anomaly_maps.cpu().numpy()
-    #         masks = self.anomaly_segmentor.convert_to_segmentation(anomaly_maps_np)
-
-    #     if return_recon:
-    #         return (
-    #             [score.item() for score in image_scores],
-    #             [mask for mask in masks],
-    #             [x.cpu() for x in x_recon],
-    #             [inp.cpu() for inp in input_images],
-    #         )
-
-    #     return [score.item()for score in image_scores], [mask for mask in masks]
-
     # 生成保存或加载模型参数的文件路径
     @staticmethod
     def _params_file(filepath, prepend=""):
@@ -343,6 +319,8 @@ class PatchCore(torch.nn.Module):
             "vq_commitment_cost": self.vqvae_model.quantizer.commitment_cost,
             "vq_backbone_name": self.vqvae_model.encoder.backbone_name,
             "vq_layers_to_extract_from": self.vqvae_model.encoder.layers_to_extract_from,
+            "vq_use_fsq": getattr(self.vqvae_model, 'use_fsq', False),
+            "vq_fsq_levels": getattr(self.vqvae_model.quantizer, 'levels', None) if getattr(self.vqvae_model, 'use_fsq', False) else None,
             "vq_lr": self.vq_lr,
             "vq_epochs": self.vq_epochs,
         }
@@ -412,7 +390,7 @@ class PatchMaker:
 
     def unpatch_scores(self, x, batchsize):
         if isinstance(x, torch.Tensor):
-            x = x.cpu.numpy()
+            x = x.cpu().numpy()
         return x.reshape(batchsize, -1, *x.shape[1:])
 
     def score(self, x):

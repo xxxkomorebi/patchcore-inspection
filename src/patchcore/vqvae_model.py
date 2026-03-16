@@ -1,9 +1,95 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from .backbones import load as load_backbone
 from .common import NetworkFeatureAggregator
+
+class ScalarQuantizer(nn.Module):
+    """
+    基于 CLIP-FSQAE 论文实现的 Finite Scalar Quantizer (FSQ)。
+    取代传统的 VectorQuantizer，不需要显式 Codebook，解决死码问题。
+    """
+    def __init__(self, levels=[3, 3, 3, 3, 3]):
+        super().__init__()                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+        # levels: 一个列表，定义每一维度的量化等级。
+        # 例如 [3, 3, 3] 表示 3 个维度，每个维度有 3 个取值 (-1, 0, 1)。
+        # 隐式 Codebook 大小 = product(levels)
+        
+        self.levels = levels
+        # 注册为 buffer 以便随模型保存
+        self.register_buffer("_levels", torch.tensor(levels, dtype=torch.int32))
+        
+        # 用于计算 implicit indices 的基数 (1, L1, L1*L2, ...)
+        _basis = torch.cumprod(torch.tensor([1] + levels[:-1]), dim=0, dtype=torch.int32)
+        self.register_buffer("_basis", _basis)
+        
+        # 隐式 Codebook 大小
+        self.codebook_size = self.levels[-1] * self._basis[-1].item()
+        
+        # 嵌入维度必须等于 levels 的长度
+        self.embedding_dim = len(levels)
+
+    def forward(self, z):
+        # z shape: [B, C, H, W]
+        # 1. 变换维度 -> [B, H, W, C]
+        z = z.permute(0, 2, 3, 1).contiguous()
+        
+        # 2. 核心 FSQ 逻辑
+        # Paper Eq: round( L/2 * tanh(z) ) or similar mapping
+        # 我们使用标准的对称映射: z -> tanh -> (-1, 1) -> scale -> round -> integers
+        
+        # 计算每一维度的缩放因子 (levels-1)/2
+        # 例如 level=3 -> scale=1; level=5 -> scale=2
+        scales = (self._levels.to(z.device) - 1).float() / 2.0
+        scales = scales.view(1, 1, 1, -1) # [1, 1, 1, C]
+        
+        # Tanh 压缩到 (-1, 1)
+        z_tanh = torch.tanh(z)
+        
+        # 缩放并四舍五入
+        z_scaled = z_tanh * scales
+        z_q = torch.round(z_scaled)
+        
+        # 3. Straight-Through Estimator (STE)
+        # 前向传播用量化值 z_q，反向传播梯度传给 z_tanh (或者直接传给 z)
+        # 这里为了稳定，让梯度流过 tanh
+        z_q = z_scaled + (z_q - z_scaled).detach()
+        
+        # 4. Renormalize (可选)
+        # 将整数值除回 (-1, 1) 范围，以便 Decoder 处理
+        # CLIP-FSQAE 论文似乎直接使用整数特征，但在 VQVAE 框架中
+        # 保持数值范围在 [-1, 1] 或 [-scale, scale] 附近通常比较好。
+        # 这里我们直接输出 z_q (数值如 -2, -1, 0, 1, 2)，这对 CNN 来说是可以接受的。
+        
+        # 5. 计算 Indices (用于 active code ratio 统计)
+        # 将多维整数坐标映射为一维 index
+        # z_q 是 centered 的 (e.g. -1, 0, 1)，我们需要 shift 到 (0, 1, 2) 来计算 index
+        z_indices = z_q + scales # shift to [0, levels-1]
+        z_indices = torch.round(z_indices).int()
+        
+        # Dot product with basis to get scalar index
+        encoding_indices = (z_indices * self._basis.view(1, 1, 1, -1)).sum(dim=-1)
+        
+        # 6. 整理输出
+        # [B, H, W, C] -> [B, C, H, W]
+        quantized = z_q.permute(0, 3, 1, 2).contiguous()
+        
+        # FSQ 没有 commitment loss，也没有 codebook loss
+        loss = torch.tensor(0.0, device=z.device, requires_grad=True)
+        
+        # 计算 perplexity (衡量隐式 codebook 使用情况)
+        # Flatten indices: [N]
+        flat_indices = encoding_indices.view(-1).long()
+        encodings = F.one_hot(flat_indices, num_classes=self.codebook_size).float()
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        
+        # Active Code Ratio
+        active_code_ratio = (encodings.sum(dim=0) > 0).float().mean()
+        
+        return quantized, loss, perplexity, encoding_indices, active_code_ratio
 
 class VectorQuantizer(nn.Module):
     """
@@ -286,7 +372,8 @@ class VQVAE(nn.Module):
 
     def __init__(self, in_channels, out_channels, num_hiddens, num_residual_layers, num_residual_hiddens,
                  num_embeddings, embedding_dim, commitment_cost, backbone_name=None, layers_to_extract_from=None, device='cpu', original_image_size=(224, 224),
-                 use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5):
+                 use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5,
+                 use_fsq=False, fsq_levels=None):
         super().__init__()
         self.device = device
         self.original_image_size = original_image_size
@@ -315,16 +402,39 @@ class VQVAE(nn.Module):
                 )
             encoder_out_channels = self.encoder.out_channels
 
-        self.pre_quantization_conv = nn.Conv2d(encoder_out_channels, embedding_dim, kernel_size=1, stride=1)
-
-        # 允许切换 EMA 版码本
-        if use_ema_codebook:
-            self.quantizer = EMAVectorQuantizer(num_embeddings, embedding_dim, commitment_cost, decay=ema_decay, eps=ema_eps)
+        if use_fsq:
+            # 如果启用 FSQ
+            if fsq_levels is None:
+                # 默认配置：5维，每维5级 -> 5^5 = 3125 种组合 (够用了)
+                # 或者按照论文 d=3, L=3 (太小?) 论文里可能是 latent pyramid
+                # 推荐配置：[8, 5, 5, 5] -> 1000 种组合; [7, 5, 5, 5, 5] -> ~8000
+                # 这里给一个稳健的默认值
+                fsq_levels = [5, 5, 5, 5, 5] 
+            
+            self.quantizer = ScalarQuantizer(levels=fsq_levels)
+            
+            # FSQ 的 embedding_dim 是由 levels 的长度决定的
+            actual_embedding_dim = len(fsq_levels)
+            
+            print(f"[VQVAE] Using FSQ! Levels: {fsq_levels}, Emb Dim: {actual_embedding_dim}, Implicit Codebook: {self.quantizer.codebook_size}")
         else:
-            self.quantizer = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
+            # 原有的 VQ 逻辑
+            actual_embedding_dim = embedding_dim
+            if use_ema_codebook:
+                self.quantizer = EMAVectorQuantizer(num_embeddings, embedding_dim, commitment_cost, decay=ema_decay, eps=ema_eps)
+            else:
+                self.quantizer = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
 
+        
+        # self.pre_quantization_conv = nn.Conv2d(encoder_out_channels, embedding_dim, kernel_size=1, stride=1)
+
+        # self.decoder = Decoder(out_channels, num_hiddens, num_residual_layers, num_residual_hiddens)
+        # self.post_quantization_conv = nn.Conv2d(embedding_dim, num_hiddens, kernel_size=1, stride=1)
+        # [修正] 必须使用 actual_embedding_dim
+        self.pre_quantization_conv = nn.Conv2d(encoder_out_channels, actual_embedding_dim, kernel_size=1, stride=1)
         self.decoder = Decoder(out_channels, num_hiddens, num_residual_layers, num_residual_hiddens)
-        self.post_quantization_conv = nn.Conv2d(embedding_dim, num_hiddens, kernel_size=1, stride=1)
+        # [修正] Post 卷积的输入也必须是 actual_embedding_dim
+        self.post_quantization_conv = nn.Conv2d(actual_embedding_dim, num_hiddens, kernel_size=1, stride=1)
 
     def forward(self, x):
         # 1. Encode
@@ -351,4 +461,4 @@ class VQVAE(nn.Module):
         quantization_error = F.mse_loss(quantized, z_e, reduction="none").mean(dim=1)
 
         # 返回 perplexity 便于监控 codebook 使用情况
-        return x_recon, vq_loss, perplexity, quantized, encoding_indices, quantization_error, active_code_ratio
+        return x_recon, vq_loss, perplexity, z_e, quantized, encoding_indices, quantization_error, active_code_ratio

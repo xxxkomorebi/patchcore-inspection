@@ -355,6 +355,8 @@ def run(
 @click.option("--vq_epochs", type=int, default=10)
 # Patch-parameters.
 @click.option("--patchsize", type=int, default=3)
+@click.option("--vq_use_fsq", is_flag=True, help="Enable Finite Scalar Quantization (FSQ) instead of VQ.")
+@click.option("--vq_fsq_levels", type=str, default="5,5,5,5,5", help="Comma-separated levels for FSQ (e.g. '3,3,3'). Controls dimension and codebook size.")
 # Nearest-Neighbour Anomaly Scorer parameters.
 # @click.option("--anomaly_scorer_num_nn", type=int, default=5)
 # # NN on GPU.
@@ -377,9 +379,17 @@ def patch_core(
     vq_lr,
     vq_epochs,
     patchsize,
+    vq_use_fsq,
+    vq_fsq_levels,
 ):
     # We assume a single PatchCore instance using the VQ-VAE architecture.
     # Ensemble logic is removed for VQ-VAE integration simplicity.
+
+    # 解析 levels 字符串为列表
+    if vq_fsq_levels:
+        fsq_levels_list = [int(x) for x in vq_fsq_levels.split(",")]
+    else:
+        fsq_levels_list = None
     
     def get_patchcore(input_shape,device):
         # nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
@@ -400,6 +410,8 @@ def patch_core(
             vq_use_ema_codebook=vq_use_ema_codebook,
             vq_ema_decay=vq_ema_decay,
             vq_ema_eps=vq_ema_eps,
+            vq_use_fsq=vq_use_fsq,          # 传入 patchcore.py
+            vq_fsq_levels=fsq_levels_list,  # 传入 patchcore.py
             vq_backbone_name=vq_backbone_name,
             vq_layers_to_extract_from=vq_layers_to_extract_from,
             # PatchCore Params
