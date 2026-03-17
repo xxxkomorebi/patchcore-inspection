@@ -11,7 +11,6 @@ import torch
 import patchcore.common
 import patchcore.metrics
 import patchcore.patchcore
-import patchcore.sampler
 import patchcore.utils
 import torch.utils.data
 
@@ -36,9 +35,6 @@ def run(methods, results_path, gpu, seed, save_segmentation_images):
     os.makedirs(results_path, exist_ok=True)
 
     device = patchcore.utils.set_torch_device(gpu)
-    # Device context here is specifically set and used later
-    # because there was GPU memory-bleeding which I could only fix with
-    # context managers.
     device_context = (
         torch.cuda.device("cuda:{}".format(device.index))
         if "cuda" in device.type.lower()
@@ -87,10 +83,11 @@ def run(methods, results_path, gpu, seed, save_segmentation_images):
                 aggregator["scores"].append(scores)
                 aggregator["segmentations"].append(segmentations)
 
+            # --- Normalise scores across models ---
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
-            scores = (scores - min_scores) / (max_scores - min_scores)
+            scores = (scores - min_scores) / (max_scores - min_scores + 1e-10)
             scores = np.mean(scores, axis=0)
 
             segmentations = np.array(aggregator["segmentations"])
@@ -146,18 +143,18 @@ def run(methods, results_path, gpu, seed, save_segmentation_images):
                 )
 
             LOGGER.info("Computing evaluation metrics.")
-            # Compute Image-level AUROC scores for all images.
+
             auroc = patchcore.metrics.compute_imagewise_retrieval_metrics(
                 scores, anomaly_labels
             )["auroc"]
 
-            # Compute PRO score & PW Auroc for all images
+            # Compute PW Auroc for all images
             pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
                 segmentations, masks_gt
             )
             full_pixel_auroc = pixel_scores["auroc"]
 
-            # Compute PRO score & PW Auroc only for images with anomalies
+            # Compute PW Auroc only for images with anomalies
             sel_idxs = []
             for i in range(len(masks_gt)):
                 if np.sum(masks_gt[i]) > 0:
@@ -197,36 +194,28 @@ def run(methods, results_path, gpu, seed, save_segmentation_images):
 
 
 @main.command("patch_core_loader")
-# Pretraining-specific parameters.
 @click.option("--patch_core_paths", "-p", type=str, multiple=True, default=[])
-# NN on GPU.
-@click.option("--faiss_on_gpu", is_flag=True)
-@click.option("--faiss_num_workers", type=int, default=8)
-def patch_core_loader(patch_core_paths, faiss_on_gpu, faiss_num_workers):
+def patch_core_loader(patch_core_paths):
     def get_patchcore_iter(device):
         for patch_core_path in patch_core_paths:
             loaded_patchcores = []
             gc.collect()
+            # Detect saved VQ-VAE models
             n_patchcores = len(
-                [x for x in os.listdir(patch_core_path) if ".faiss" in x]
+                [x for x in os.listdir(patch_core_path) if x.endswith("vqvae_model.pth")]
             )
             if n_patchcores == 1:
-                nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
                 patchcore_instance = patchcore.patchcore.PatchCore(device)
                 patchcore_instance.load_from_path(
-                    load_path=patch_core_path, device=device, nn_method=nn_method
+                    load_path=patch_core_path, device=device
                 )
                 loaded_patchcores.append(patchcore_instance)
             else:
                 for i in range(n_patchcores):
-                    nn_method = patchcore.common.FaissNN(
-                        faiss_on_gpu, faiss_num_workers
-                    )
                     patchcore_instance = patchcore.patchcore.PatchCore(device)
                     patchcore_instance.load_from_path(
                         load_path=patch_core_path,
                         device=device,
-                        nn_method=nn_method,
                         prepend="Ensemble-{}-{}_".format(i + 1, n_patchcores),
                     )
                     loaded_patchcores.append(patchcore_instance)

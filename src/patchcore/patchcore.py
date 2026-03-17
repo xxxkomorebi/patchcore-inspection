@@ -6,36 +6,87 @@ import pickle
 import numpy as np
 import torch
 import torch.nn.functional as F
-from skimage.metrics import structural_similarity as ssim
-import tqdm # 进度条
+import tqdm
 import torch.utils.data
 
 import patchcore
 import patchcore.common
 import patchcore.vqvae_model
 
-# MAD calculation
-def calculate_mad_map(original_latent, reconstructed_latent):
-    abs_diff = torch.abs(original_latent - reconstructed_latent)
-    mad_map = torch.mean(abs_diff, dim=1)
+# MAD calculation: quantization error in latent space
+def calculate_mad_map(z_e, z_q):
+    """Quantization error map: mean(|z_e - z_q|, dim=C).
+
+    Measures how far the encoder output strays from the nearest
+    codebook vector at each spatial position.
+
+    Args:
+        z_e: [B, C, H, W] encoder output (pre-quantization).
+        z_q: [B, C, H, W] quantized latent (post-quantization).
+
+    Returns:
+        mad_map: [B, H, W] per-pixel anomaly score.
+    """
+    mad_map = torch.abs(z_e - z_q).mean(dim=1)
     return mad_map
 
-# SSIM calculation (pixel-wise map)
-def calculate_ssim_map(original_image, reconstructed_image):
-    ssim_maps = []
-    for i in range(original_image.shape[0]):
-        img_np = original_image[i].permute(1, 2, 0).cpu().numpy()
-        recon_np = reconstructed_image[i].permute(1, 2, 0).cpu().numpy()
-        
-        # full=True returns the SSIM map, data_range=1.0 for [0,1] images
-        _, ssim_map_i = ssim(img_np, recon_np, data_range=1.0, channel_axis=-1, full=True)
-        # skimage may return [H, W, C] for multichannel; reduce to [H, W]
-        if ssim_map_i.ndim == 3:
-            ssim_map_i = ssim_map_i.mean(axis=-1)
-        ssim_maps.append(torch.from_numpy(ssim_map_i).to(original_image.device))
-            
-    ssim_maps_torch = torch.stack(ssim_maps)
-    return ssim_maps_torch
+
+def _gaussian_kernel_2d(kernel_size=11, sigma=1.5, channels=1, device=None):
+    """Create a 2D Gaussian kernel for SSIM computation."""
+    coords = torch.arange(kernel_size, dtype=torch.float32, device=device) - kernel_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = torch.outer(g, g)
+    g = g / g.sum()
+    return g.expand(channels, 1, kernel_size, kernel_size).contiguous()
+
+
+def calculate_ssim_map(original_image, reconstructed_image, c1=0.01, c2=0.03,
+                       kernel_size=11, sigma=1.5):
+    """Compute per-pixel SM (Similarity Map) following the VAE-GRF paper.
+
+    SM(x_i) = SSIM(p_i, q_i)
+            = (2 mu_p mu_q + c1)(2 sigma_pq + c2)
+              / ((mu_p^2 + mu_q^2 + c1)(sigma_p^2 + sigma_q^2 + c2))
+
+    where c1 = 0.01, c2 = 0.03 as stated in the paper (NOT the squared
+    constants used in the standard SSIM implementation).
+
+    Args:
+        original_image:      [B, C, H, W] tensor in [0, 1].
+        reconstructed_image: [B, C, H, W] tensor in [0, 1].
+        c1, c2: stabilisation constants (paper defaults).
+        kernel_size: Gaussian window size.
+        sigma: Gaussian window std.
+
+    Returns:
+        ssim_map: [B, H, W] tensor — per-pixel similarity.
+    """
+    device = original_image.device
+    channels = original_image.shape[1]
+    kernel = _gaussian_kernel_2d(kernel_size, sigma, channels, device)
+    pad = kernel_size // 2
+
+    # Means
+    mu_p = F.conv2d(original_image, kernel, padding=pad, groups=channels)
+    mu_q = F.conv2d(reconstructed_image, kernel, padding=pad, groups=channels)
+
+    mu_p_sq = mu_p * mu_p
+    mu_q_sq = mu_q * mu_q
+    mu_pq = mu_p * mu_q
+
+    # Variances / covariance
+    sigma_p_sq = F.conv2d(original_image * original_image, kernel, padding=pad, groups=channels) - mu_p_sq
+    sigma_q_sq = F.conv2d(reconstructed_image * reconstructed_image, kernel, padding=pad, groups=channels) - mu_q_sq
+    sigma_pq = F.conv2d(original_image * reconstructed_image, kernel, padding=pad, groups=channels) - mu_pq
+
+    # SSIM map per channel
+    numerator = (2 * mu_pq + c1) * (2 * sigma_pq + c2)
+    denominator = (mu_p_sq + mu_q_sq + c1) * (sigma_p_sq + sigma_q_sq + c2)
+    ssim_map = numerator / denominator          # [B, C, H, W]
+
+    # Average across channels → [B, H, W]
+    ssim_map = ssim_map.mean(dim=1)
+    return ssim_map
 
 # 获取日志记录器实例
 LOGGER = logging.getLogger(__name__)
@@ -252,30 +303,29 @@ class PatchCore(torch.nn.Module):
             # 2. 获取重建图
             x_recon, _, _, z_e, quantized_features, _, _, _ = self._embed(images)
 
-            # 1. Calculate MAD Map (on latent space)
-            mad_map = calculate_mad_map(z_e, quantized_features) # [B, H_latent, W_latent]
-            
-            # 2. Calculate SSIM Map (on image space)
-            # Ensure x_recon and input_images are in the correct range [0,1] for SSIM
-            # Assuming they are already in [0,1]
-            ssim_map = calculate_ssim_map(input_images, x_recon) # [B, H, W]
-            
-            # Upsample mad_map to match ssim_map size if different
-            if mad_map.shape[-2:] != ssim_map.shape[-2:]:
-                mad_map = F.interpolate(mad_map.unsqueeze(1), size=ssim_map.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
-            
-            # 3. Combine MAD and SSIM maps (element-wise multiplication)
-            # User requested MAD ⊗ SM. Assuming SM_anomaly = 1 - SSIM_similarity
-            combined_anomaly_maps = mad_map * (1 - ssim_map)
-            
-            anomaly_maps = combined_anomaly_maps
-            
-            # 后续处理逻辑保持不变
+            # 1. MAD map (latent space): quantization error |z_e - z_q|
+            mad_map = calculate_mad_map(z_e, quantized_features)  # [B, H_lat, W_lat]
+
+            # 2. SM map (image space): per-pixel SSIM
+            sm_map = calculate_ssim_map(input_images, x_recon)  # [B, H, W]
+
+            # Upsample MAD to image resolution if needed
+            if mad_map.shape[-2:] != sm_map.shape[-2:]:
+                mad_map = F.interpolate(
+                    mad_map.unsqueeze(1), size=sm_map.shape[-2:],
+                    mode='bilinear', align_corners=False
+                ).squeeze(1)
+
+            # 3. Combined anomaly map: MAD × (1 - SSIM)
+            #    MAD high = large quantization error (latent anomaly)
+            #    (1 - SSIM) high = poor reconstruction (image anomaly)
+            anomaly_maps = mad_map * (1 - sm_map)
+
+            # ---- Image-level scoring: top-0.5% pixel mean ----
             flat_scores = anomaly_maps.flatten(1)
-            # 使用 Top-K 平均值作为图片级分数
-            k = max(1, int(flat_scores.shape[1] * 0.001))
+            k = max(1, int(flat_scores.shape[1] * 0.005))
             image_scores = torch.topk(flat_scores, k, dim=1).values.mean(dim=1)
-            
+
             anomaly_maps_np = anomaly_maps.cpu().numpy()
             masks = self.anomaly_segmentor.convert_to_segmentation(anomaly_maps_np)
 

@@ -2,14 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Commands
-
-All commands require `PYTHONPATH=src` since the package is not installed as a module:
-
-```bash
-export PYTHONPATH=src
-```
-
 **Train and evaluate:**
 ```bash
 python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images \

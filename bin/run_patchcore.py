@@ -103,15 +103,8 @@ def run(
                 torch.cuda.empty_cache()
                 PatchCore.fit(dataloaders["training"])
 
-            # 保存每个 epoch 的 perplexity 到 CSV
-            if hasattr(PatchCore, "perplexity_history"):
-                import csv
-                per_csv_path = os.path.join(run_save_path, "perplexity_epoch.csv")
-                with open(per_csv_path, "w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["epoch", "perplexity"])
-                    for idx, val in enumerate(PatchCore.perplexity_history, start=1):
-                        writer.writerow([idx, val])
+            # 保存 perplexity_history 供后续写入每个类别目录
+            perplexity_history = getattr(PatchCore, "perplexity_history", None)
 
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
@@ -141,7 +134,7 @@ def run(
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
-            scores = (scores - min_scores) / (max_scores - min_scores)
+            scores = (scores - min_scores) / (max_scores - min_scores + 1e-10)
             scores = np.mean(scores, axis=0)
 
             segmentations = np.array(aggregator["segmentations"])
@@ -172,35 +165,6 @@ def run(
                 ]
 
             if save_segmentation_images:
-                # def image_transform(image):
-                #     in_std = np.array(
-                #         dataloaders["testing"].dataset.transform_std
-                #     ).reshape(-1, 1, 1)
-                #     in_mean = np.array(
-                #         dataloaders["testing"].dataset.transform_mean
-                #     ).reshape(-1, 1, 1)
-                #     image = dataloaders["testing"].dataset.transform_img(image)
-                #     return np.clip(
-                #         (image.numpy() * in_std + in_mean) * 255, 0, 255
-                #     ).astype(np.uint8)
-
-                # def mask_transform(mask):
-                #     return dataloaders["testing"].dataset.transform_mask(mask).numpy()
-
-                # image_save_path = os.path.join(
-                #     run_save_path, "segmentation_images", dataset_name
-                # )
-                # os.makedirs(image_save_path, exist_ok=True)
-                # patchcore.utils.plot_segmentation_images(
-                #     image_save_path,
-                #     image_paths,
-                #     segmentations,
-                #     scores,
-                #     mask_paths,
-                #     image_transform=image_transform,
-                #     mask_transform=mask_transform,
-                # )
-
                 # 若需要重建图，可在此同时保存重建和分割可视化
                 if len(recon_collector) > 0:
                     recons = recon_collector[0]
@@ -269,18 +233,32 @@ def run(
                             fig.savefig(os.path.join(recon_vis_path, savename))
                             plt.close(fig)
 
+                    # 保存 perplexity 到每个类别的 recon 目录
+                    if perplexity_history is not None:
+                        recon_dir = os.path.join(
+                            run_save_path, "recon_segmentation_images", dataset_name
+                        )
+                        os.makedirs(recon_dir, exist_ok=True)
+                        per_csv_path = os.path.join(recon_dir, "perplexity_epoch.csv")
+                        with open(per_csv_path, "w", newline="") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(["epoch", "perplexity"])
+                            for idx, val in enumerate(perplexity_history, start=1):
+                                writer.writerow([idx, val])
+
             LOGGER.info("Computing evaluation metrics.")
+
             auroc = patchcore.metrics.compute_imagewise_retrieval_metrics(
                 scores, anomaly_labels
             )["auroc"]
 
-            # Compute PRO score & PW Auroc for all images
+            # Compute PW Auroc for all images
             pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
                 segmentations, masks_gt
             )
             full_pixel_auroc = pixel_scores["auroc"]
 
-            # Compute PRO score & PW Auroc only images with anomalies
+            # Compute PW Auroc only images with anomalies
             sel_idxs = []
             for i in range(len(masks_gt)):
                 if np.sum(masks_gt[i]) > 0:
@@ -357,11 +335,6 @@ def run(
 @click.option("--patchsize", type=int, default=3)
 @click.option("--vq_use_fsq", is_flag=True, help="Enable Finite Scalar Quantization (FSQ) instead of VQ.")
 @click.option("--vq_fsq_levels", type=str, default="5,5,5,5,5", help="Comma-separated levels for FSQ (e.g. '3,3,3'). Controls dimension and codebook size.")
-# Nearest-Neighbour Anomaly Scorer parameters.
-# @click.option("--anomaly_scorer_num_nn", type=int, default=5)
-# # NN on GPU.
-# @click.option("--faiss_on_gpu", is_flag=True)
-# @click.option("--faiss_num_workers", type=int, default=8)
 def patch_core(
     vq_in_channels,
     vq_out_channels,
@@ -392,8 +365,6 @@ def patch_core(
         fsq_levels_list = None
     
     def get_patchcore(input_shape,device):
-        # nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
-
         patchcore_instance = patchcore.patchcore.PatchCore(device)
         patchcore_instance.load(
             device=device,

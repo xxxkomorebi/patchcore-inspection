@@ -278,11 +278,6 @@ class Encoder(nn.Module):
             )
             self.conv_out = nn.Conv2d(num_hiddens, num_hiddens, kernel_size=3, stride=1, padding=1)
 
-            # # 使用三层卷积网络
-            # self.conv_in = nn.Conv2d(in_channels, num_hiddens // 2, kernel_size=4, stride=2, padding=1)
-            # self.conv_mid = nn.Conv2d(num_hiddens // 2, num_hiddens, kernel_size=4, stride=2, padding=1)
-            # self.conv_out = nn.Conv2d(num_hiddens, num_hiddens, kernel_size=3, stride=1, padding=1)
-            
             if self.layers_to_extract_from:
                 total_channels = 0
                 for layer_idx in self.layers_to_extract_from:
@@ -307,10 +302,7 @@ class Encoder(nn.Module):
             f2 = self.block2(f1) # Layer 2
             f3 = self.block3(f2) # Layer 3
             f4 = self.conv_out(f3) # Layer 4
-            # f1 = F.relu(self.conv_in(x))      # Layer 1
-            # f2 = F.relu(self.conv_mid(f1))    # Layer 2
-            # f3 = self.conv_out(f2)            # Layer 3
-        
+
             if not self.layers_to_extract_from:
                 return f4
             
@@ -425,15 +417,8 @@ class VQVAE(nn.Module):
             else:
                 self.quantizer = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
 
-        
-        # self.pre_quantization_conv = nn.Conv2d(encoder_out_channels, embedding_dim, kernel_size=1, stride=1)
-
-        # self.decoder = Decoder(out_channels, num_hiddens, num_residual_layers, num_residual_hiddens)
-        # self.post_quantization_conv = nn.Conv2d(embedding_dim, num_hiddens, kernel_size=1, stride=1)
-        # [修正] 必须使用 actual_embedding_dim
         self.pre_quantization_conv = nn.Conv2d(encoder_out_channels, actual_embedding_dim, kernel_size=1, stride=1)
         self.decoder = Decoder(out_channels, num_hiddens, num_residual_layers, num_residual_hiddens)
-        # [修正] Post 卷积的输入也必须是 actual_embedding_dim
         self.post_quantization_conv = nn.Conv2d(actual_embedding_dim, num_hiddens, kernel_size=1, stride=1)
 
     def forward(self, x):
