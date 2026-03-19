@@ -1,17 +1,20 @@
 export PYTHONPATH=src
-datapath=MPDD
+datapath=MVTec
 # datasets=('bracket_black' 'bracket_brown' 'bracket_white' 'connector' 'metal_plate' 'tubes')
 datasets=('bottle' 'cable'  'capsule'  'carpet'  'grid'  'hazelnut' 'leather'  'metal_nut'  'pill' 'screw' 'tile' 'toothbrush' 'transistor' 'wood' 'zipper')
+#datasets=('carpet' 'grid' 'metal_nut' 'screw' 'toothbrush' 'transistor')
 dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '"${dataset}"; done))
 
 ############# Detection
-python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_e50 --log_project MPDD_GRE results \
+python bin/run_patchcore.py --gpu 0 --seed 123 --save_segmentation_images --log_group all_e100 --log_project MVTEC results \
 patch_core \
-    --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 128 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
-    --vq_lr 0.001 --vq_epochs 50 \
+    --vq_in_channels 3 --vq_out_channels 3 --vq_num_hiddens 128 --vq_num_embeddings 1024 --vq_embedding_dim 128 --vq_commitment_cost 0.25 \
+    --vq_lr 0.001 --vq_epochs 100 \
     --vq_use_ema_codebook --vq_ema_decay 0.99 --vq_ema_eps 1e-5 \
+    --vq_num_residual_layers 2 --vq_num_residual_hiddens 128 \
+    --perceptual_loss_weight 0.1 \
     --patchsize 3 \
-dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mpdd $datapath
+dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mvtec $datapath
 
 # Parameter reference:
 # --vq_num_hiddens        encoder/decoder backbone channels

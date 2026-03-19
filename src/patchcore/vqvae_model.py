@@ -327,9 +327,26 @@ class Encoder(nn.Module):
 
         return h
 
+class ResidualBlock(nn.Module):
+    """Conv3x3 → BN → ReLU → Conv3x3 → BN + skip connection."""
+    def __init__(self, channels, hidden_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, x):
+        return F.relu(x + self.block(x))
+
+
 class Decoder(nn.Module):
     """
-    Simple Decoder for VQ-VAE. Reconstructs image from feature map.
+    Decoder for VQ-VAE. Reconstructs image from feature map.
+    Optionally includes residual blocks between conv_in and the PixelShuffle chain.
     """
     def __init__(self, out_channels, num_hiddens, num_residual_layers, num_residual_hiddens):
         super().__init__()
@@ -338,6 +355,12 @@ class Decoder(nn.Module):
 
         # Initial feature mixing
         self.conv_in = nn.Conv2d(num_hiddens, num_hiddens, kernel_size=3, stride=1, padding=1)
+
+        # Residual blocks (empty Sequential when num_residual_layers == 0)
+        res_hidden = num_residual_hiddens if num_residual_hiddens > 0 else num_hiddens
+        self.residual_stack = nn.Sequential(
+            *[ResidualBlock(num_hiddens, res_hidden) for _ in range(num_residual_layers)]
+        )
 
         # PixelShuffle 上采样链，总放大 4x（适配 /4 下采样特征）
         self.ps1 = nn.Sequential(
@@ -351,10 +374,11 @@ class Decoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.conv_out = nn.Conv2d(num_hiddens // 2, out_channels, kernel_size=3, stride=1, padding=1)
-        self.output_act = nn.Identity()  
+        self.output_act = nn.Identity()
 
     def forward(self, x):
         h = F.relu(self.conv_in(x))
+        h = self.residual_stack(h)
         h = self.ps1(h)
         h = self.ps2(h)
         out = self.conv_out(h)

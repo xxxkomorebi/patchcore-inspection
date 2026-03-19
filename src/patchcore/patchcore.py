@@ -5,13 +5,55 @@ import pickle
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as tv_models
 import tqdm
 import torch.utils.data
 
 import patchcore
 import patchcore.common
 import patchcore.vqvae_model
+
+
+class PerceptualLoss(nn.Module):
+    """L1 perceptual loss using frozen VGG16 intermediate features."""
+
+    # ImageNet normalisation expected by VGG
+    _MEAN = [0.485, 0.456, 0.406]
+    _STD = [0.229, 0.224, 0.225]
+
+    def __init__(self, device="cpu"):
+        super().__init__()
+        vgg = tv_models.vgg16(weights=tv_models.VGG16_Weights.DEFAULT).features
+        # Extract up to relu1_2 (idx 4), relu2_2 (idx 9), relu3_3 (idx 16)
+        self.slices = nn.ModuleList([
+            nn.Sequential(*list(vgg.children())[:4]),   # relu1_2
+            nn.Sequential(*list(vgg.children())[4:9]),  # relu2_2
+            nn.Sequential(*list(vgg.children())[9:16]), # relu3_3
+        ])
+        for p in self.parameters():
+            p.requires_grad = False
+        self.register_buffer(
+            "mean", torch.tensor(self._MEAN).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "std", torch.tensor(self._STD).view(1, 3, 1, 1)
+        )
+        self.to(device)
+
+    def _normalize(self, x):
+        return (x - self.mean) / self.std
+
+    def forward(self, x, x_recon):
+        x = self._normalize(x)
+        x_recon = self._normalize(x_recon)
+        loss = 0.0
+        for s in self.slices:
+            x = s(x)
+            x_recon = s(x_recon)
+            loss += F.l1_loss(x_recon, x)
+        return loss
 
 # MAD calculation: quantization error in latent space
 def calculate_mad_map(z_e, z_q):
@@ -125,6 +167,7 @@ class PatchCore(torch.nn.Module):
         patchstride=1,
         vq_lr=1e-4,
         vq_epochs=10,
+        perceptual_loss_weight=0.0,
         **kwargs,
     ):
         self.device = device
@@ -159,6 +202,13 @@ class PatchCore(torch.nn.Module):
         self.vq_epochs = vq_epochs
         self.vq_optimizer = torch.optim.Adam(self.vqvae_model.parameters(), lr=self.vq_lr)
         self.vq_loss_fn = F.mse_loss # Reconstruction loss
+
+        # Perceptual loss (VGG-based)
+        self.perceptual_loss_weight = perceptual_loss_weight
+        if perceptual_loss_weight > 0:
+            self.perceptual_loss_fn = PerceptualLoss(device=device)
+        else:
+            self.perceptual_loss_fn = None
 
         self.anomaly_segmentor = patchcore.common.RescaleSegmentor(
             device=self.device, target_size=input_shape[-2:]
@@ -202,6 +252,8 @@ class PatchCore(torch.nn.Module):
     def fit(self, training_data):
         # Train VQ-VAE
         self._train_vqvae(training_data)
+        # Calibrate normalization using normal training samples
+        self._calibrate_normalization(training_data)
 
     def _train_vqvae(self, input_data):
         """Trains the VQ-VAE model using reconstruction and VQ losses."""
@@ -230,9 +282,13 @@ class PatchCore(torch.nn.Module):
                     
                     # Calculate Reconstruction Loss (MSE)
                     recon_loss = self.vq_loss_fn(x_recon, input_image)
-                    
+
                     # Total Loss
                     loss = recon_loss + vq_loss
+
+                    # Perceptual loss
+                    if self.perceptual_loss_fn is not None:
+                        loss = loss + self.perceptual_loss_weight * self.perceptual_loss_fn(input_image, x_recon)
                     
                     # Backward pass and optimization
                     self.vq_optimizer.zero_grad()
@@ -252,6 +308,59 @@ class PatchCore(torch.nn.Module):
                 f"Avg Perplexity: {avg_perplexity:.3f}; "
                 f"Active Code Ratio: {avg_active_ratio:.3f}"
             )
+
+    def _calibrate_normalization(self, training_data):
+        """Compute per-pixel mean and std of anomaly maps on normal samples."""
+        LOGGER.info("Calibrating anomaly map normalization on training data...")
+        self.vqvae_model.eval()
+
+        # Welford online algorithm for per-pixel mean/std
+        count = 0
+        mean = None
+        m2 = None
+
+        with torch.no_grad():
+            for item in tqdm.tqdm(training_data, desc="Calibrating normalization", leave=False):
+                image = item
+                if isinstance(item, dict):
+                    image = item["image"]
+                elif isinstance(item, (list, tuple)):
+                    image = item[0]
+
+                input_images = image.to(torch.float).to(self.device)
+                x_recon, _, _, z_e, quantized_features, _, _, _ = self._embed(image)
+
+                mad_map = calculate_mad_map(z_e, quantized_features)
+                sm_map = calculate_ssim_map(input_images, x_recon)
+
+                if mad_map.shape[-2:] != sm_map.shape[-2:]:
+                    mad_map = F.interpolate(
+                        mad_map.unsqueeze(1), size=sm_map.shape[-2:],
+                        mode='bilinear', align_corners=False
+                    ).squeeze(1)
+
+                anomaly_maps = mad_map * (1 - sm_map)  # [B, H, W]
+
+                # Welford update per sample in batch
+                for i in range(anomaly_maps.shape[0]):
+                    amap = anomaly_maps[i]  # [H, W]
+                    count += 1
+                    if mean is None:
+                        mean = torch.zeros_like(amap)
+                        m2 = torch.zeros_like(amap)
+                    delta = amap - mean
+                    mean = mean + delta / count
+                    delta2 = amap - mean
+                    m2 = m2 + delta * delta2
+
+        if count > 1:
+            std = torch.sqrt(m2 / (count - 1))
+        else:
+            std = torch.ones_like(mean)
+
+        self.norm_mean = mean.cpu()  # [H, W]
+        self.norm_std = std.cpu()    # [H, W]
+        LOGGER.info("Normalization calibration done (n=%d samples).", count)
 
     # patchcore的推理入口
     def predict(self, data, return_recon=False):
@@ -321,6 +430,13 @@ class PatchCore(torch.nn.Module):
             #    (1 - SSIM) high = poor reconstruction (image anomaly)
             anomaly_maps = mad_map * (1 - sm_map)
 
+            # Adaptive normalization: z-score using training set statistics
+            if hasattr(self, 'norm_mean') and self.norm_mean is not None:
+                norm_mean = self.norm_mean.to(anomaly_maps.device)
+                norm_std = self.norm_std.to(anomaly_maps.device)
+                anomaly_maps = (anomaly_maps - norm_mean) / (norm_std + 1e-6)
+                anomaly_maps = torch.clamp(anomaly_maps, min=0)
+
             # ---- Image-level scoring: top-0.5% pixel mean ----
             flat_scores = anomaly_maps.flatten(1)
             k = max(1, int(flat_scores.shape[1] * 0.005))
@@ -373,7 +489,12 @@ class PatchCore(torch.nn.Module):
             "vq_fsq_levels": getattr(self.vqvae_model.quantizer, 'levels', None) if getattr(self.vqvae_model, 'use_fsq', False) else None,
             "vq_lr": self.vq_lr,
             "vq_epochs": self.vq_epochs,
+            "perceptual_loss_weight": self.perceptual_loss_weight,
         }
+        # Save normalization statistics if available
+        if hasattr(self, 'norm_mean') and self.norm_mean is not None:
+            patchcore_params["norm_mean"] = self.norm_mean.numpy()
+            patchcore_params["norm_std"] = self.norm_std.numpy()
         with open(self._params_file(save_path, prepend), "wb") as save_file:
             pickle.dump(patchcore_params, save_file, pickle.HIGHEST_PROTOCOL)
 
@@ -389,12 +510,24 @@ class PatchCore(torch.nn.Module):
         with open(self._params_file(load_path, prepend), "rb") as load_file:
             patchcore_params = pickle.load(load_file)
         
+        # Extract normalization stats before passing to load()
+        norm_mean_np = patchcore_params.pop("norm_mean", None)
+        norm_std_np = patchcore_params.pop("norm_std", None)
+
         # Load VQ-VAE parameters and initialize model
         self.load(**patchcore_params, device=device)
-        
+
         # Load VQ-VAE state dict
         vqvae_path = os.path.join(load_path, prepend + "vqvae_model.pth")
         self.vqvae_model.load_state_dict(torch.load(vqvae_path, map_location=device))
+
+        # Restore normalization statistics if saved
+        if norm_mean_np is not None:
+            self.norm_mean = torch.from_numpy(norm_mean_np)
+            self.norm_std = torch.from_numpy(norm_std_np)
+        else:
+            self.norm_mean = None
+            self.norm_std = None
 
 
 # Image handling classes.

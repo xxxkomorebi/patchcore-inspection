@@ -318,8 +318,8 @@ def run(
 @click.option("--vq_num_hiddens", type=int, default=128)
 @click.option("--vq_num_residual_layers", type=int, default=0)
 @click.option("--vq_num_residual_hiddens", type=int, default=0)
-@click.option("--vq_num_embeddings", type=int, default=512)
-@click.option("--vq_embedding_dim", type=int, default=64)
+@click.option("--vq_num_embeddings", type=int, default=1024)
+@click.option("--vq_embedding_dim", type=int, default=128)
 @click.option("--vq_commitment_cost", type=float, default=0.25)
 # EMA codebook parameters
 @click.option("--vq_use_ema_codebook", is_flag=True, help="Use EMA-based codebook update instead of direct gradient update.")
@@ -335,6 +335,7 @@ def run(
 @click.option("--patchsize", type=int, default=3)
 @click.option("--vq_use_fsq", is_flag=True, help="Enable Finite Scalar Quantization (FSQ) instead of VQ.")
 @click.option("--vq_fsq_levels", type=str, default="5,5,5,5,5", help="Comma-separated levels for FSQ (e.g. '3,3,3'). Controls dimension and codebook size.")
+@click.option("--perceptual_loss_weight", type=float, default=0.1, show_default=True, help="Weight for VGG perceptual loss. Set 0 to disable.")
 def patch_core(
     vq_in_channels,
     vq_out_channels,
@@ -354,6 +355,7 @@ def patch_core(
     patchsize,
     vq_use_fsq,
     vq_fsq_levels,
+    perceptual_loss_weight,
 ):
     # We assume a single PatchCore instance using the VQ-VAE architecture.
     # Ensemble logic is removed for VQ-VAE integration simplicity.
@@ -389,6 +391,7 @@ def patch_core(
             patchsize=patchsize,
             vq_lr=vq_lr,
             vq_epochs=vq_epochs,
+            perceptual_loss_weight=perceptual_loss_weight,
         )
         return [patchcore_instance] # Return as list for compatibility with ensemble logic
 
